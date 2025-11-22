@@ -1,4 +1,3 @@
-
 import torch.nn as nn
 from torch.utils.data import Dataset
 import torch.utils.data
@@ -382,36 +381,22 @@ class LossWithLS(nn.Module):
         self.size = size
 
     def forward(self, prediction, target, mask):
-        # """
-        # prediction of shape: (batch_size, max_words, vocab_size)
-        # target and mask of shape: (batch_size, max_words)
-        # """
-        # prediction = prediction.view(-1, prediction.size(-1))  # (batch_size * max_words, vocab_size)
-        # target = target.contiguous().view(-1)  # (batch_size * max_words)
-        # mask = mask.float().view(-1)
-
-        # labels = torch.full_like(prediction, self.smooth / (self.size - 1))
-        # labels.scatter_(1, target.unsqueeze(1), self.confidence)
-
-        # loss = self.criterion(prediction, labels)  # (batch_size * max_words, vocab_size)
-        # loss = (loss.sum(1) * mask).sum() / mask.sum()
-
-        # return loss
         """
-        pred   : (batch*seq_len, vocab)
-        target : (batch*seq_len)
+        prediction of shape: (batch_size, max_words, vocab_size)
+        target and mask of shape: (batch_size, max_words)
         """
-        mask = (target < 0) | (target >= self.size)  # mask invalid targets
-        target = target.clone()
-        target[mask] = 0  # temporary dummy index
-    
-        # Create smoothed distribution
-        true_dist = pred.clone()
-        true_dist.fill_(self.smooth / (self.size - 1))
-        true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
-        true_dist[mask] = 0
-    
-        return self.criterion(pred, true_dist).sum()
+        prediction = prediction.view(-1, prediction.size(-1))  # (batch_size * max_words, vocab_size)
+        target = target.contiguous().view(-1)  # (batch_size * max_words)
+        mask = mask.float().view(-1)
+
+        labels = torch.full_like(prediction, self.smooth / (self.size - 1))
+        labels.scatter_(1, target.unsqueeze(1), self.confidence)
+
+        loss = self.criterion(prediction, labels)  # (batch_size * max_words, vocab_size)
+        loss = (loss.sum(1) * mask).sum() / mask.sum()
+
+        return loss
+       
 
 # import torch
 # import torch.nn.functional as F
@@ -646,12 +631,11 @@ class TextSummaryDataset(Dataset):
 dataset = TextSummaryDataset(contents, summaries, tokenizer, max_len)
 loader = DataLoader(dataset, batch_size=16, shuffle=True)
 
-print(loader)
 # ================================================
 # 4. INITIALIZE MODEL
 # ================================================
 dummy_vocab = tokenizer.get_vocab()
-loss_fn = LossWithLS(size=dummy_vocab, smooth=0.1)
+print(len(dummy_vocab))
 
 model = Transformer(
     d_model=d_model,
@@ -663,6 +647,7 @@ model = Transformer(
 optimizer = torch.optim.Adam(model.parameters(), lr=2e-4)
 loss_fn = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
+criterion = LossWithLS(len(dummy_vocab), 0.2)
 
 # ================================================
 # 5. TRAINING LOOP (10 epochs)
@@ -703,12 +688,9 @@ for epoch in range(2):
         # )
         logits = F.log_softmax(outputs, dim=-1).reshape(-1, vocab_size)
         targets = reply_target_ids_masked.reshape(-1)
-        loss = loss_fn(logits, targets)
-
-
+        loss = criterion(outputs, reply_target_ids, reply_target_mask)
         loss.backward()
         optimizer.step()
-
         total_loss += loss.item()
 
     print(f"Epoch {epoch+1}/10   Loss: {total_loss:.4f}")
