@@ -1,3 +1,4 @@
+
 import torch.nn as nn
 from torch.utils.data import Dataset
 import torch.utils.data
@@ -20,7 +21,7 @@ d_model = 256
 heads = 8
 num_layers =4
 epochs = 2
-Batch=16
+Batch=128
 
 
 def create_masks(question, reply_input, reply_target):
@@ -258,7 +259,7 @@ class MultiHeadAttention(nn.Module):
         v = v.view(B, -1, self.heads, self.d_k).permute(0, 2, 1, 3).contiguous()
 
         # Call flashattention (requires float16/bf16 for best perf). We'll pass fp16 but convert back after.
-        attn_out = flashattention_triton(q, k, v, TILE_N=16, TILE_D=16, CHUNK_D=16)
+        attn_out = flashattention_triton(q, k, v, TILE_N=32, TILE_D=32, CHUNK_D=32)
         # attn_out: (B, H, N, D) dtype=float16
 
         # Convert to float32 for the linear concat
@@ -347,7 +348,7 @@ class Transformer(nn.Module):
     def forward(self, src_words, src_mask, target_words, target_mask):
         encoded = self.encode(src_words, src_mask)
         decoded = self.decode(target_words, target_mask, encoded, src_mask)
-        out = F.log_softmax(self.logit(decoded), dim=2)
+        out = self.logit(decoded)
         return out
 
 class AdamWarmup:
@@ -373,180 +374,39 @@ class AdamWarmup:
 
 
 class LossWithLS(nn.Module):
-    def __init__(self, size, smooth):
-        super(LossWithLS, self).__init__()
-        self.criterion = nn.KLDivLoss(reduction='none')  # Use reduction='none' instead of size_average=False, reduce=False
+    def __init__(self, size, smooth, pad_token_id=-100):
+        super().__init__()
+        self.criterion = nn.KLDivLoss(reduction='batchmean')
         self.confidence = 1.0 - smooth
         self.smooth = smooth
         self.size = size
+        self.pad_id = pad_token_id
 
     def forward(self, prediction, target, mask):
-        """
-        prediction of shape: (batch_size, max_words, vocab_size)
-        target and mask of shape: (batch_size, max_words)
-        """
-        prediction = prediction.view(-1, prediction.size(-1))  # (batch_size * max_words, vocab_size)
-        target = target.contiguous().view(-1)  # (batch_size * max_words)
+        # Flatten
+        prediction = prediction.view(-1, prediction.size(-1))
+        target = target.view(-1)
         mask = mask.float().view(-1)
 
-        labels = torch.full_like(prediction, self.smooth / (self.size - 1))
-        labels.scatter_(1, target.unsqueeze(1), self.confidence)
+        # ----- FIX: handle PAD tokens -----
+        target_fixed = target.clone()
+        target_fixed[target_fixed == self.pad_id] = 0  # dummy index for PAD
 
-        loss = self.criterion(prediction, labels)  # (batch_size * max_words, vocab_size)
-        loss = (loss.sum(1) * mask).sum() / mask.sum()
+        # Label smoothing distribution
+        labels = torch.full_like(prediction, self.smooth / (self.size - 1))
+        labels.scatter_(1, target_fixed.unsqueeze(1), self.confidence)
+        # print("lael")
+        # print(labels)
+        # print("predi")
+        # print(prediction)
+
+        # Compute KL divergence
+        loss = self.criterion(prediction, labels).sum(1)
+
+        # apply mask (PAD tokens removed)
+        loss = (loss * mask).sum() / mask.sum()
 
         return loss
-       
-
-# import torch
-# import torch.nn.functional as F
-
-# # Ensure device
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# # 1. Sample data (16 sentences to match batch size)
-# sample_questions = [
-#     "Hello world!", "How are you?", "Transformers are cool.", "I like pizza.",
-#     "Today is sunny.", "PyTorch is fun.", "Let's test this model.", "OpenAI makes GPT models.",
-#     "ChatGPT can help.", "This is a transformer test.", "I enjoy coding.", "Deep learning is powerful.",
-#     "BERT tokenizer works well.", "Testing batch processing.", "Sequence modeling is useful.", "End-to-end test."
-# ]
-
-# sample_replies = [
-#     "Hi!", "I'm fine, thanks.", "Yes, indeed!", "Me too.", 
-#     "Enjoy the sun.", "Absolutely!", "Let's see.", "Definitely.", 
-#     "Sure!", "It works.", "I agree.", "Very true.", 
-#     "Works perfectly.", "All good.", "Very useful.", "Done."
-# ]
-
-# # 2. Tokenize with BERT tokenizer
-# encoded_questions = tokenizer(
-#     sample_questions, padding='max_length', truncation=True, 
-#     max_length=max_len, return_tensors='pt'
-# )
-# encoded_replies = tokenizer(
-#     sample_replies, padding='max_length', truncation=True, 
-#     max_length=max_len, return_tensors='pt'
-# )
-
-# # 3. Move all token tensors to device
-# question_ids = encoded_questions['input_ids'].to(device)
-
-# # Decoder input: remove last token, then pad to max_len if needed
-# reply_input_ids = encoded_replies['input_ids'][:, :-1].to(device)
-# # Ensure length matches max_len for flash attention
-# if reply_input_ids.size(1) < max_len:
-#     pad_len = max_len - reply_input_ids.size(1)
-#     reply_input_ids = F.pad(reply_input_ids, (0, pad_len), value=tokenizer.pad_token_id)
-
-# # Decoder target: remove first token
-# reply_target_ids = encoded_replies['input_ids'][:, 1:].to(device)
-# if reply_target_ids.size(1) < max_len:
-#     pad_len = max_len - reply_target_ids.size(1)
-#     reply_target_ids = F.pad(reply_target_ids, (0, pad_len), value=tokenizer.pad_token_id)
-
-# # 4. Create masks
-# q_mask, reply_input_mask, reply_target_mask = create_masks(
-#     question_ids, reply_input_ids, reply_target_ids
-# )
-
-# # 5. Initialize transformer
-# dummy_vocab = tokenizer.get_vocab()
-# model = Transformer(d_model=d_model, heads=heads, num_layers=num_layers, word_map=dummy_vocab).to(device)
-
-# # 6. Forward pass
-# outputs = model(question_ids, q_mask, reply_input_ids, reply_input_mask)
-
-# print("Output shape:", outputs.shape)  # should be (16, max_len, vocab_size)
-# print("Sample output (first 5 tokens of first batch):", outputs[0, :5, :10])
-
-#----------------------------Bert------------------------------------------------
-
-# import torch
-# import torch.nn.functional as F
-# import pandas as pd
-# from transformers import BertTokenizerFast
-
-# # Ensure device
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# # Load BERT tokenizer
-# tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
-
-# # Max sequence length
-# max_len = 128  # same as your transformer setting
-
-# # -----------------------------
-# # 1. Load data from CSV
-# # -----------------------------
-# df = pd.read_csv("/kaggle/input/news-summarization/data.csv")
-
-# # Make sure columns exist
-# assert 'Content' in df.columns and 'Summary' in df.columns, "CSV must have 'Content' and 'Summary' columns"
-
-# # For demo purposes, select first 16 examples (adjust batch size accordingly)
-# df = df.head(16)
-
-# contents = df['Content'].tolist()
-# summaries = df['Summary'].tolist()
-
-# # -----------------------------
-# # 2. Tokenize with BERT tokenizer
-# # -----------------------------
-# encoded_questions = tokenizer(
-#     contents,
-#     padding='max_length',
-#     truncation=True,
-#     max_length=max_len,
-#     return_tensors='pt'
-# )
-
-# encoded_replies = tokenizer(
-#     summaries,
-#     padding='max_length',
-#     truncation=True,
-#     max_length=max_len,
-#     return_tensors='pt'
-# )
-
-
-
-# question_ids = encoded_questions['input_ids'].to(device)
-
-# # # Decoder input: remove last token, pad if needed
-# reply_input_ids = encoded_replies['input_ids'][:, :-1].to(device)
-# if reply_input_ids.size(1) < max_len:
-#     pad_len = max_len - reply_input_ids.size(1)
-#     reply_input_ids = F.pad(reply_input_ids, (0, pad_len), value=tokenizer.pad_token_id)
-
-# # Decoder target: remove first token, pad if needed
-# reply_target_ids = encoded_replies['input_ids'][:, 1:].to(device)
-# if reply_target_ids.size(1) < max_len:
-#     pad_len = max_len - reply_target_ids.size(1)
-#     reply_target_ids = F.pad(reply_target_ids, (0, pad_len), value=tokenizer.pad_token_id)
-
-# # print(reply_target_ids)
-# # # -----------------------------
-# # # 4. Create masks
-# # # -----------------------------
-# q_mask, reply_input_mask, reply_target_mask = create_masks(
-#     question_ids, reply_input_ids, reply_target_ids
-# )
-
-# # # -----------------------------
-# # # 5. Initialize transformer
-# # # -----------------------------
-# dummy_vocab = tokenizer.get_vocab()
-# model = Transformer(d_model=d_model, heads=heads, num_layers=num_layers, word_map=dummy_vocab).to(device)
-
-# # # -----------------------------
-# # # 6. Forward pass
-# # # -----------------------------
-# outputs = model(question_ids, q_mask, reply_input_ids, reply_input_mask)
-
-# print("Output shape:", outputs.shape)  # should be (16, max_len, vocab_size)
-# print("Sample output (first 5 tokens of first batch):", outputs[0, :5, :10])
-#----------------------------------------------------------------------------------
 
 
 #---------------------------Bert -ec----------------------------------
@@ -562,7 +422,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ================================================
 # 1. LOAD CSV (1000 samples)
 # ================================================
-df = pd.read_csv("/kaggle/input/news-summarization/data.csv").head(16)
+df = pd.read_csv("/kaggle/input/news-summarization/data.csv").head(3200)
 
 contents  = df["Content"].astype(str).tolist()
 summaries = df["Summary"].astype(str).tolist()
@@ -629,7 +489,7 @@ class TextSummaryDataset(Dataset):
 # 3. DATALOADER
 # ================================================
 dataset = TextSummaryDataset(contents, summaries, tokenizer, max_len)
-loader = DataLoader(dataset, batch_size=16, shuffle=True)
+loader = DataLoader(dataset, batch_size=64, shuffle=True)
 
 # ================================================
 # 4. INITIALIZE MODEL
@@ -645,14 +505,16 @@ model = Transformer(
 ).to(device)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=2e-4)
-loss_fn = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
 criterion = LossWithLS(len(dummy_vocab), 0.2)
 
 # ================================================
 # 5. TRAINING LOOP (10 epochs)
 # ================================================
-for epoch in range(2):
+loss_fn = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+print("training.............")
+epochs=1
+for epoch in range(epochs):
 
     model.train()
     total_loss = 0
@@ -670,30 +532,169 @@ for epoch in range(2):
         q_mask, reply_input_mask, reply_target_mask = create_masks(
             question_ids, reply_input_ids, reply_target_ids
         )
-        print("question_ids:", question_ids.shape, question_ids.dtype, question_ids.min(), question_ids.max())
-        print("reply_input_ids:", reply_input_ids.shape, reply_input_ids.dtype, reply_input_ids.min(), reply_input_ids.max())
-        print("reply_target_ids:", reply_target_ids.shape, reply_target_ids.dtype, reply_target_ids.min(), reply_target_ids.max())
-        
-
+        # print("question_ids:", question_ids.shape, question_ids.dtype, question_ids.min(), question_ids.max())
+        # print("reply_input_ids:", reply_input_ids.shape, reply_input_ids.dtype, reply_input_ids.min(), reply_input_ids.max())
+        # print("reply_target_ids:", reply_target_ids.shape, reply_target_ids.dtype, reply_target_ids.min(), reply_target_ids.max())
         optimizer.zero_grad()
-
-        # Forward pas
         outputs = model(question_ids, q_mask, reply_input_ids, reply_input_mask)
-
-        # Reshape for CE loss
-        vocab_size = outputs.size(-1)
-        # loss = loss_fn(
-        #     outputs.reshape(-1, vocab_size),
-        #     reply_target_ids.reshape(-1)
+        log_probs = F.log_softmax(outputs, dim=-1)
+        # targets = reply_target_ids_masked.reshape(-1)
+        # target_probs = F.one_hot(
+        #     reply_target_ids_masked, 
+        #     num_classes=vocab_size
+        # ).float()
+        
+        # # Mask padding tokens
+        # target_probs[reply_target_ids_masked == -100] = 0
+        # loss = F.kl_div(
+        #     log_probs,                     # shape [B,T,V], log-probs
+        #     target_probs,                 # shape [B,T,V], probs
+        #     reduction="batchmean"
         # )
-        logits = F.log_softmax(outputs, dim=-1).reshape(-1, vocab_size)
-        targets = reply_target_ids_masked.reshape(-1)
-        loss = criterion(outputs, reply_target_ids, reply_target_mask)
+
+        logits = outputs  # raw model outputs
+        vocab_size = outputs.size(-1)        
+        loss = F.cross_entropy(
+            logits.reshape(-1, vocab_size),       # [B*T, V]
+            reply_target_ids_masked.reshape(-1),  # [B*T], integers
+            ignore_index=-100                     # ignore padding
+        )
+        # loss = criterion(log_probs, reply_target_ids, reply_target_mask)
         loss.backward()
         optimizer.step()
-        total_loss += loss.item()
+        print(loss.item())
+        # total_loss += loss.item()
+    if epoch == epochs - 1:
+        state = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict()
+        }
+        torch.save(state, '/kaggle/working/checkpoint_last_epoch.pth.tar')  # Kaggle-safe path
+
 
     print(f"Epoch {epoch+1}/10   Loss: {total_loss:.4f}")
 
 
-print("Training complete.")
+print("Training complete")
+
+# def evaluate(transformer, question, question_mask, max_len, word_map):
+#     """
+#     Performs Greedy Decoding with a batch size of 1
+#     """
+#     rev_word_map = {v: k for k, v in word_map.items()}
+#     transformer.eval()
+#     print("Is in evaluation mode:", not transformer.training)
+#     start_token = word_map['<start>']
+#     encoded = transformer.encode(question, question_mask)
+#     words = torch.LongTensor([[start_token]]).to(device)
+
+#     for step in range(max_len - 1):
+#         size = words.shape[1]
+#         target_mask = torch.triu(torch.ones(size, size)).transpose(0, 1).type(dtype=torch.uint8)
+#         target_mask = target_mask.to(device).unsqueeze(0).unsqueeze(0)
+#         decoded = transformer.decode(words, target_mask, encoded, question_mask)
+#         predictions = transformer.logit(decoded[:, -1])
+#         _, next_word = torch.max(predictions, dim=1)
+#         next_word = next_word.item()
+#         if next_word == word_map['<end>']:
+#             break
+#         words = torch.cat([words, torch.LongTensor([[next_word]]).to(device)], dim=1)  # (1,step+2)
+#         # Construct Sentence
+#     if words.dim() == 2:
+#             words = words.squeeze(0)
+#             words = words.tolist()
+
+#     sen_idx = [w for w in words if w not in {word_map['<start>']}]
+#     sentence = ' '.join([rev_word_map[sen_idx[k]] for k in range(len(sen_idx))])
+
+#     return sentence
+
+def evaluate(transformer, question_ids, question_mask, max_len, word_map):
+    """
+    Greedy decoding for batch size = 1 using BERT tokenizer mapping.
+    """
+    transformer.eval()
+    print("Is in evaluation mode:", not transformer.training)
+    
+    start_token = word_map['<start>']
+    end_token   = word_map['<end>']
+    
+    # Encode the input
+    encoded = transformer.encode(question_ids, question_mask)
+    
+    # Initialize output sequence with start token
+    words = torch.LongTensor([[start_token]]).to(question_ids.device)
+
+    for step in range(max_len - 1):
+        size = words.shape[1]
+
+        # Causal mask for decoder
+        target_mask = torch.triu(torch.ones(size, size)).transpose(0, 1).type(torch.uint8)
+        target_mask = target_mask.to(question_ids.device).unsqueeze(0).unsqueeze(0)
+
+        # Decode
+        decoded = transformer.decode(words, target_mask, encoded, question_mask)
+        predictions = transformer.logit(decoded[:, -1])  # logits for last token
+
+        # Pick next token (greedy)
+        _, next_word = torch.max(predictions, dim=1)
+        next_word = next_word.item()
+
+        if next_word == end_token:
+            break
+
+        words = torch.cat([words, torch.LongTensor([[next_word]]).to(question_ids.device)], dim=1)
+
+    # Convert token IDs to words
+    words = words.squeeze(0).tolist()  # flatten to list
+    sen_idx = [w for w in words if w not in {start_token}]
+    sentence = ' '.join([rev_word_map[w] for w in sen_idx])
+
+    # Clean up BERT tokens
+    sentence = sentence.replace(" ##", "")  # merge wordpieces
+    sentence = sentence.replace("[PAD]", "").strip()
+
+    return sentence
+
+word_map1 = tokenizer.get_vocab()  # token -> id mapping
+# Map start and end tokens
+word_map1['<start>'] = tokenizer.cls_token_id  # [CLS]
+word_map1['<end>'] = tokenizer.sep_token_id    # [SEP]
+
+rev_word_map = {v: k for k, v in word_map1.items()}  # id -> token mapping
+
+transformer = model.to(device)
+
+# Create optimizer wrapper
+adam_optimizer = torch.optim.Adam(transformer.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9)
+transformer_optimizer = AdamWarmup(model_size=d_model, warmup_steps=4000, optimizer=adam_optimizer)
+
+# Load checkpoint
+
+checkpoint = torch.load('/kaggle/working/checkpoint_last_epoch.pth.tar', map_location=device)
+transformer.load_state_dict(checkpoint['model_state_dict'])
+transformer_optimizer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+epoch = checkpoint['epoch']
+
+print(f"Loaded checkpoint from epoch {epoch}")
+question ="This is a big passage. Please summarize it in short so that users should be able to understand it very clearly\n"
+
+# Tokenize using BERT tokenizer
+max_len = 100
+tokens = tokenizer(question, 
+                   max_length=max_len, 
+                   padding='max_length', 
+                   truncation=True, 
+                   return_tensors='pt')
+
+# Move inputs to device
+question_ids = tokens['input_ids'].to(device)           # shape: [1, max_len]
+question_mask = tokens['attention_mask'].to(device)    # shape: [1, max_len]
+
+# Adjust mask shape if your model expects (batch, 1, 1, seq_len)
+question_mask = question_mask.unsqueeze(1).unsqueeze(1)  # shape: [1, 1, 1, max_len]
+
+# Generate output using your transformer
+sentence = evaluate(transformer, question_ids, question_mask, int(max_len), word_map1)
+print(sentence)
