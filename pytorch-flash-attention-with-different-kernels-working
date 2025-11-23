@@ -1,0 +1,629 @@
+import torch.nn as nn
+from torch.utils.data import Dataset
+import torch.utils.data
+import math
+import pandas as pd
+from torch.nn.utils.rnn import pad_sequence
+from transformers import BertTokenizerFast
+tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+import math
+import triton
+import triton.language as tl
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+max_len = 128
+d_model = 256
+heads = 8
+num_layers =4
+epochs = 2
+Batch=128
+
+
+def create_masks(question, reply_input, reply_target):
+    def subsequent_mask(size):
+        mask = torch.triu(torch.ones(size, size)).transpose(0, 1).type(dtype=torch.uint8)
+        return mask.unsqueeze(0)
+    question_mask = question != 0
+    question_mask = question_mask.to(device)
+    question_mask = question_mask.unsqueeze(1).unsqueeze(1)  # (batch_size, 1, 1, max_words)
+    reply_input_mask = reply_input != 0
+    reply_input_mask = reply_input_mask.unsqueeze(1)  # (batch_size, 1, max_words)
+    reply_input_mask = reply_input_mask & subsequent_mask(reply_input.size(-1)).type_as(reply_input_mask.data)
+    reply_input_mask = reply_input_mask.unsqueeze(1)  # (batch_size, 1, max_words, max_words)
+    reply_target_mask = reply_target != 0  # (batch_size, max_words)
+    return question_mask, reply_input_mask, reply_target_mask
+
+
+class Embeddings(nn.Module):
+    """
+    Implements embeddings of the words and adds their positional encodings.
+    """
+
+    def __init__(self, vocab_size, d_model, max_len=128, num_layers=3):
+        super(Embeddings, self).__init__()
+        self.d_model = d_model
+        self.dropout = nn.Dropout(0.1)
+        self.embed = nn.Embedding(vocab_size, d_model)
+        self.pe = self.create_positinal_encoding(max_len, self.d_model)  # (1, max_len, d_model)
+        self.te = self.create_positinal_encoding(num_layers, self.d_model)  # (1, num_layers, d_model)
+        self.dropout = nn.Dropout(0.1)
+
+    def create_positinal_encoding(self, max_len, d_model):
+        pe = torch.zeros(max_len, d_model).to(device)
+        for pos in range(max_len):  # for each position of the word
+            for i in range(0, d_model, 2):  # for each dimension of the each position
+                pe[pos, i] = math.sin(pos / (10000 ** ((2 * i) / d_model)))
+                pe[pos, i + 1] = math.cos(pos / (10000 ** ((2 * (i + 1)) / d_model)))
+        pe = pe.unsqueeze(0)  # include the batch size
+        return pe
+    def forward(self, embedding, layer_idx):
+        if layer_idx == 0:
+            embedding = self.embed(embedding) * math.sqrt(self.d_model)
+        embedding += self.pe[:,
+                     :embedding.size(1)]  # pe will automatically be expanded with the same batch size as encoded_words
+        # embedding: (batch_size, max_len, d_model), te: (batch_size, 1, d_model)
+        embedding += self.te[:, layer_idx, :].unsqueeze(1).repeat(1, embedding.size(1), 1)
+        embedding = self.dropout(embedding)
+        return embedding
+
+
+@triton.jit
+def attention_tile_kernel(
+    Q_ptr, K_ptr, V_ptr, out_ptr,
+    Q_len, KV_len, D, num_q_tiles,
+    TILE_N: tl.constexpr, TILE_D: tl.constexpr, TILE_K: tl.constexpr, CHUNK_D: tl.constexpr
+):
+    pid_bh = tl.program_id(0)  # batch*head
+    pid_tq = tl.program_id(1)  # Q tiles
+
+    # indices for Q tile
+    start_q = pid_tq * TILE_N
+    rn = start_q + tl.arange(0, TILE_N)[:, None]  # shape (TILE_N,1)
+    cd = tl.arange(0, TILE_D)[None, :]            # shape (1,TILE_D)
+
+    # accumulator for output tile
+    out_tile = tl.zeros((TILE_N, TILE_D), dtype=tl.float32)
+
+    # Loop over KV tiles
+    for k_start in range(0, KV_len, TILE_K):
+        k_idx = k_start + tl.arange(0, TILE_K)[None, :]
+        mask_k = k_idx < KV_len
+
+        # accumulator for Q@Kᵀ
+        acc = tl.zeros((TILE_N, TILE_K), dtype=tl.float32)
+
+        # compute dot products in chunks along D
+        for d_off in range(0, D, CHUNK_D):
+            cd_sub = d_off + tl.arange(0, CHUNK_D)[None, :]
+
+            # load Q tile
+            q_sub = tl.load(Q_ptr + pid_bh * Q_len * D + rn * D + cd_sub,
+                            mask=(rn < Q_len) & (cd_sub < D), other=0.0)
+
+            # load K tile
+            k_sub = tl.load(K_ptr + pid_bh * KV_len * D + k_idx * D + cd_sub,
+                            mask=mask_k & (cd_sub < D), other=0.0)
+
+            # accumulate Q@Kᵀ
+            acc += tl.sum(q_sub.to(tl.float32)[:, None, :] * k_sub.to(tl.float32)[None, :, :], axis=2)
+
+        # Softmax over KV dimension
+        row_max = tl.max(acc, axis=1)
+        exp_tile = tl.exp(acc - row_max[:, None])
+        row_sum = tl.sum(exp_tile, axis=1)
+        softmax_tile = exp_tile / row_sum[:, None]  # shape (TILE_N, TILE_K)
+
+        # Multiply by V tile
+        # for d_off in range(0, D, CHUNK_D):
+        #     cd_sub = d_off + tl.arange(0, CHUNK_D)[None, :]
+        #     v_sub = tl.load(V_ptr + pid_bh * KV_len * D + k_idx * D + cd_sub,
+        #                     mask=mask_k & (cd_sub < D), other=0.0)
+        #     out_tile += tl.dot(softmax_tile, v_sub.to(tl.float32))
+        for d_off in range(0, D, CHUNK_D):
+            cd_sub = d_off + tl.arange(0, CHUNK_D)[None, :]
+            v_sub = tl.load(V_ptr + pid_bh * KV_len * D + k_idx * D + cd_sub,
+                            mask=mask_k & (cd_sub < D), other=0.0)
+            # Broadcast multiply softmax over KV dimension, then sum along KV axis
+            out_tile += tl.sum(softmax_tile[:, None, :] * v_sub.to(tl.float32)[None, :, :], axis=2)
+
+
+    # Store output
+    out_idx = pid_bh * num_q_tiles * TILE_N * D + pid_tq * TILE_N * D + rn * D + cd
+    mask_out = (rn < Q_len) & (cd < D)
+    tl.store(out_ptr + out_idx, out_tile.to(tl.float16), mask=mask_out)
+
+# -----------------------------
+
+def flashattention_triton(q_tf, k_tf, v_tf, TILE_N=16, TILE_D=16, CHUNK_D=16, TILE_K=16):
+    """
+    Cross-attention using Triton FlashAttention kernel with KV tiling.
+    """
+    q = q_tf.to("cuda", dtype=torch.float16).contiguous()
+    k = k_tf.to("cuda", dtype=torch.float16).contiguous()
+    v = v_tf.to("cuda", dtype=torch.float16).contiguous()
+
+    B, H, Q_len, D = q.shape
+    _, _, KV_len, _ = k.shape
+    BH = B * H
+
+    q_flat = q.reshape(BH, Q_len, D)
+    k_flat = k.reshape(BH, KV_len, D)
+    v_flat = v.reshape(BH, KV_len, D)
+
+    # Pad Q and KV independently
+    padded_Q = math.ceil(Q_len / TILE_N) * TILE_N
+    padded_KV = math.ceil(KV_len / TILE_K) * TILE_K
+
+    if padded_Q != Q_len:
+        q_pad = torch.zeros((BH, padded_Q, D), device="cuda", dtype=torch.float16)
+        q_pad[:, :Q_len, :] = q_flat
+        q_flat = q_pad
+
+    if padded_KV != KV_len:
+        k_pad = torch.zeros((BH, padded_KV, D), device="cuda", dtype=torch.float16)
+        v_pad = torch.zeros((BH, padded_KV, D), device="cuda", dtype=torch.float16)
+        k_pad[:, :KV_len, :] = k_flat
+        v_pad[:, :KV_len, :] = v_flat
+        k_flat = k_pad
+        v_flat = v_pad
+
+    num_q_tiles = padded_Q // TILE_N
+    out_flat = torch.zeros((BH, padded_Q, D), device="cuda", dtype=torch.float32)
+    grid = (BH, num_q_tiles)
+
+    # Launch Triton kernel
+    attention_tile_kernel[grid](
+        q_flat, k_flat, v_flat,
+        out_flat,
+        Q_len, KV_len, D, num_q_tiles,
+        TILE_N, TILE_D, CHUNK_D, TILE_K
+    )
+
+    out = out_flat[:, :Q_len].reshape(B, H, Q_len, D)
+    return out
+
+
+# -------------------------------
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, heads, d_model):
+        super(MultiHeadAttention, self).__init__()
+        assert d_model % heads == 0
+        self.d_k = d_model // heads
+        self.heads = heads
+        self.dropout = nn.Dropout(0.1)
+        self.query = nn.Linear(d_model, d_model)
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+        self.concat = nn.Linear(d_model, d_model)
+
+    def forward(self, query, key, value, mask=None):
+        # query/key/value: (B, seq_len, d_model) float32 by default
+        B = query.shape[0]
+
+        # Linear projections (stay in float32)
+        q = self.query(query)
+        k = self.key(key)
+        v = self.value(value)
+
+        # Reshape to (B, H, N, D)
+        q = q.view(B, -1, self.heads, self.d_k).permute(0, 2, 1, 3).contiguous()
+        k = k.view(B, -1, self.heads, self.d_k).permute(0, 2, 1, 3).contiguous()
+        v = v.view(B, -1, self.heads, self.d_k).permute(0, 2, 1, 3).contiguous()
+
+        # Call flashattention (requires float16/bf16 for best perf). We'll pass fp16 but convert back after.
+        attn_out = flashattention_triton(q, k, v, TILE_N=16, TILE_D=16, CHUNK_D=16, TILE_K=16)
+        # attn_out: (B, H, N, D) dtype=float16
+
+        # Convert to float32 for the linear concat
+        attn_out = attn_out.float()
+
+        # Merge heads: (B, N, H*D)
+        context = attn_out.permute(0, 2, 1, 3).contiguous().view(B, -1, self.heads * self.d_k)
+
+        # Final linear
+        out = self.concat(context)
+        return out
+
+
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model, middle_dim=2048):
+            super(FeedForward, self).__init__()
+            self.fc1 = nn.Linear(d_model, middle_dim)
+            self.fc2 = nn.Linear(middle_dim, d_model)
+            self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+            out = F.relu(self.fc1(x))
+            out = self.fc2(self.dropout(out))
+            return out
+
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, heads):
+        super(EncoderLayer, self).__init__()
+        self.layernorm = nn.LayerNorm(d_model)
+        self.self_multihead = MultiHeadAttention(heads, d_model)
+        self.feed_forward = FeedForward(d_model)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, embeddings, mask):
+        interacted = self.dropout(self.self_multihead(embeddings, embeddings, embeddings, mask))
+        interacted = self.layernorm(interacted + embeddings)
+        feed_forward_out = self.dropout(self.feed_forward(interacted))
+        encoded = self.layernorm(feed_forward_out + interacted)
+        return encoded
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, heads):
+        super(DecoderLayer, self).__init__()
+        self.layernorm = nn.LayerNorm(d_model)
+        self.self_multihead = MultiHeadAttention(heads, d_model)
+        self.src_multihead = MultiHeadAttention(heads, d_model)
+        self.feed_forward = FeedForward(d_model)
+        self.dropout = nn.Dropout(0.1)
+    def forward(self, embeddings, encoded, src_mask, target_mask):
+        query = self.dropout(self.self_multihead(embeddings, embeddings, embeddings, target_mask))
+        query = self.layernorm(query + embeddings)
+        interacted = self.dropout(self.src_multihead(query, encoded, encoded, src_mask))
+        interacted = self.layernorm(interacted + query)
+        feed_forward_out = self.dropout(self.feed_forward(interacted))
+        decoded = self.layernorm(feed_forward_out + interacted)
+        return decoded
+
+
+class Transformer(nn.Module):
+    def __init__(self, d_model, heads, num_layers, word_map):
+        super(Transformer, self).__init__()
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.vocab_size = len(word_map)
+        self.embed = Embeddings(self.vocab_size, d_model, num_layers=num_layers)
+        self.encoder = EncoderLayer(d_model, heads)
+        self.decoder = DecoderLayer(d_model, heads)
+        self.logit = nn.Linear(d_model, self.vocab_size)
+
+    def encode(self, src_embeddings, src_mask):
+        for i in range(self.num_layers):
+            src_embeddings = self.embed(src_embeddings, i)
+            src_embeddings = self.encoder(src_embeddings, src_mask)
+        return src_embeddings
+
+    def decode(self, tgt_embeddings, target_mask, src_embeddings, src_mask):
+        for i in range(self.num_layers):
+            tgt_embeddings = self.embed(tgt_embeddings, i)
+            # print("embeddings")
+            # print(tgt_embeddings)
+            tgt_embeddings = self.decoder(tgt_embeddings, src_embeddings, src_mask, target_mask)
+        return tgt_embeddings
+
+    def forward(self, src_words, src_mask, target_words, target_mask):
+        encoded = self.encode(src_words, src_mask)
+        decoded = self.decode(target_words, target_mask, encoded, src_mask)
+        out = self.logit(decoded)
+        return out
+
+class AdamWarmup:
+    def __init__(self, model_size, warmup_steps, optimizer):
+        self.model_size = model_size
+        self.warmup_steps = warmup_steps
+        self.optimizer = optimizer
+        self.current_step = 0
+        self.lr = 0
+
+    def get_lr(self):
+        return self.model_size ** (-0.5) * min(self.current_step ** (-0.5),
+                                               self.current_step * self.warmup_steps ** (-1.5))
+    def step(self):
+        # Increment the number of steps each time we call the step function
+        self.current_step += 1
+        lr = self.get_lr()
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        # update the learning rate
+        self.lr = lr
+        self.optimizer.step()
+
+
+class LossWithLS(nn.Module):
+    def __init__(self, size, smooth, pad_token_id=-100):
+        super().__init__()
+        self.criterion = nn.KLDivLoss(reduction='batchmean')
+        self.confidence = 1.0 - smooth
+        self.smooth = smooth
+        self.size = size
+        self.pad_id = pad_token_id
+
+    def forward(self, prediction, target, mask):
+        # Flatten
+        prediction = prediction.view(-1, prediction.size(-1))
+        target = target.view(-1)
+        mask = mask.float().view(-1)
+
+        # ----- FIX: handle PAD tokens -----
+        target_fixed = target.clone()
+        target_fixed[target_fixed == self.pad_id] = 0  # dummy index for PAD
+
+        # Label smoothing distribution
+        labels = torch.full_like(prediction, self.smooth / (self.size - 1))
+        labels.scatter_(1, target_fixed.unsqueeze(1), self.confidence)
+        # print("lael")
+        # print(labels)
+        # print("predi")
+        # print(prediction)
+
+        # Compute KL divergence
+        loss = self.criterion(prediction, labels).sum(1)
+
+        # apply mask (PAD tokens removed)
+        loss = (loss * mask).sum() / mask.sum()
+
+        return loss
+
+
+#---------------------------Bert -ec----------------------------------
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ================================================
+# 1. LOAD CSV (1000 samples)
+# ================================================
+df = pd.read_csv("/kaggle/input/news-summarization/data.csv").head(3200)
+
+contents  = df["Content"].astype(str).tolist()
+summaries = df["Summary"].astype(str).tolist()
+
+
+# ================================================
+# 2. CUSTOM DATASET
+# ================================================
+class TextSummaryDataset(Dataset):
+    def __init__(self, contents, summaries, tokenizer, max_len):
+        self.contents = contents
+        self.summaries = summaries
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.pad = tokenizer.pad_token_id
+
+    def __len__(self):
+        return len(self.contents)
+
+    def __getitem__(self, idx):
+        content = self.contents[idx]
+        summary = self.summaries[idx]
+
+        # Encode input (Content)
+        enc = self.tokenizer(
+            content,
+            padding='max_length', truncation=True,
+            max_length=self.max_len,
+            return_tensors='pt'
+        )
+
+        # Encode output (Summary)
+        dec = self.tokenizer(
+            summary,
+            padding='max_length', truncation=True,
+            max_length=self.max_len,
+            return_tensors='pt'
+        )
+
+        # Tensors are shape (1, max_len) → remove dimension
+        input_ids = enc['input_ids'].squeeze(0)
+        summary_ids = dec['input_ids'].squeeze(0)
+
+        # Decoder input (shift right)
+        reply_input_ids = summary_ids[:-1]
+        reply_input_ids = F.pad(reply_input_ids,
+                                (0, self.max_len - reply_input_ids.size(0)),
+                                value=self.pad)
+
+        # Decoder target (shift left)
+        reply_target_ids = summary_ids[1:]
+        reply_target_ids = F.pad(reply_target_ids,
+                                 (0, self.max_len - reply_target_ids.size(0)),
+                                 value=self.pad)
+
+        return {
+            "question_ids": input_ids,
+            "reply_input_ids": reply_input_ids,
+            "reply_target_ids": reply_target_ids
+        }
+
+
+# ================================================
+# 3. DATALOADER
+# ================================================
+dataset = TextSummaryDataset(contents, summaries, tokenizer, max_len)
+loader = DataLoader(dataset, batch_size=64, shuffle=True)
+
+# ================================================
+# 4. INITIALIZE MODEL
+# ================================================
+dummy_vocab = tokenizer.get_vocab()
+print(len(dummy_vocab))
+
+model = Transformer(
+    d_model=d_model,
+    heads=heads,
+    num_layers=num_layers,
+    word_map=dummy_vocab
+).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=2e-4)
+
+criterion = LossWithLS(len(dummy_vocab), 0.2)
+
+# ================================================
+# 5. TRAINING LOOP (10 epochs)
+# ================================================
+loss_fn = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+print("training.............")
+epochs=4
+for epoch in range(epochs):
+
+    model.train()
+    total_loss = 0
+
+    for batch in loader:
+
+        question_ids = batch["question_ids"].to(device)
+        reply_input_ids = batch["reply_input_ids"].to(device)
+        reply_target_ids = batch["reply_target_ids"].to(device)
+
+        reply_target_ids_masked = reply_target_ids.clone()
+        reply_target_ids_masked[reply_target_ids_masked == tokenizer.pad_token_id] = -100
+
+        # Create masks
+        q_mask, reply_input_mask, reply_target_mask = create_masks(
+            question_ids, reply_input_ids, reply_target_ids
+        )
+        # print("question_ids:", question_ids.shape, question_ids.dtype, question_ids.min(), question_ids.max())
+        # print("reply_input_ids:", reply_input_ids.shape, reply_input_ids.dtype, reply_input_ids.min(), reply_input_ids.max())
+        # print("reply_target_ids:", reply_target_ids.shape, reply_target_ids.dtype, reply_target_ids.min(), reply_target_ids.max())
+        optimizer.zero_grad()
+        outputs = model(question_ids, q_mask, reply_input_ids, reply_input_mask)
+        log_probs = F.log_softmax(outputs, dim=-1)
+        # targets = reply_target_ids_masked.reshape(-1)
+        # target_probs = F.one_hot(
+        #     reply_target_ids_masked, 
+        #     num_classes=vocab_size
+        # ).float()
+        
+        # # Mask padding tokens
+        # target_probs[reply_target_ids_masked == -100] = 0
+        # loss = F.kl_div(
+        #     log_probs,                     # shape [B,T,V], log-probs
+        #     target_probs,                 # shape [B,T,V], probs
+        #     reduction="batchmean"
+        # )
+
+        logits = outputs  # raw model outputs
+        vocab_size = outputs.size(-1)        
+        loss = F.cross_entropy(
+            logits.reshape(-1, vocab_size),       # [B*T, V]
+            reply_target_ids_masked.reshape(-1),  # [B*T], integers
+            ignore_index=-100                     # ignore padding
+        )
+        # loss = criterion(log_probs, reply_target_ids, reply_target_mask)
+        loss.backward()
+        optimizer.step()
+        print(loss.item())
+        # total_loss += loss.item()
+    if epoch == epochs - 1:
+        state = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict()
+        }
+        torch.save(state, '/kaggle/working/checkpoint_last_epoch.pth.tar')  # Kaggle-safe path
+
+
+    print(f"Epoch {epoch+1}/10   Loss: {total_loss:.4f}")
+
+
+print("Training complete")
+
+
+def evaluate(transformer, question_ids, question_mask, max_len, word_map):
+    """
+    Greedy decoding for batch size = 1 using BERT tokenizer mapping.
+    """
+    transformer.eval()
+    print("Is in evaluation mode:", not transformer.training)
+    
+    start_token = word_map['<start>']
+    end_token   = word_map['<end>']
+    
+    # Encode the input
+    encoded = transformer.encode(question_ids, question_mask)
+    
+    # Initialize output sequence with start token
+    words = torch.LongTensor([[start_token]]).to(question_ids.device)
+
+    for step in range(max_len - 1):
+        size = words.shape[1]
+
+        # Causal mask for decoder
+        target_mask = torch.triu(torch.ones(size, size)).transpose(0, 1).type(torch.uint8)
+        target_mask = target_mask.to(question_ids.device).unsqueeze(0).unsqueeze(0)
+
+        # Decode
+        decoded = transformer.decode(words, target_mask, encoded, question_mask)
+        predictions = transformer.logit(decoded[:, -1])  # logits for last token
+        print(predictions)
+
+        # Pick next token (greedy)
+        _, next_word = torch.max(predictions, dim=1)
+        next_word = next_word.item()
+
+        if next_word == end_token:
+            break
+
+        words = torch.cat([words, torch.LongTensor([[next_word]]).to(question_ids.device)], dim=1)
+
+    # Convert token IDs to words
+    words = words.squeeze(0).tolist()  # flatten to list
+    sen_idx = [w for w in words if w not in {start_token}]
+    sentence = ' '.join([rev_word_map[w] for w in sen_idx])
+
+    # Clean up BERT tokens
+    sentence = sentence.replace(" ##", "")  # merge wordpieces
+    sentence = sentence.replace("[PAD]", "").strip()
+
+    return sentence
+
+word_map1 = tokenizer.get_vocab()  # token -> id mapping
+# Map start and end tokens
+word_map1['<start>'] = tokenizer.cls_token_id  # [CLS]
+word_map1['<end>'] = tokenizer.sep_token_id    # [SEP]
+
+rev_word_map = {v: k for k, v in word_map1.items()}  # id -> token mapping
+
+transformer = model.to(device)
+
+# Create optimizer wrapper
+adam_optimizer = torch.optim.Adam(transformer.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9)
+transformer_optimizer = AdamWarmup(model_size=d_model, warmup_steps=4000, optimizer=adam_optimizer)
+
+# Load checkpoint
+
+checkpoint = torch.load('/kaggle/working/checkpoint_last_epoch.pth.tar', map_location=device)
+transformer.load_state_dict(checkpoint['model_state_dict'])
+transformer_optimizer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+epoch = checkpoint['epoch']
+
+print(f"Loaded checkpoint from epoch {epoch}")
+question ="This is a big passage. Please summarize it in short so that users should be able to understand it very clearly\n"
+
+# Tokenize using BERT tokenizer
+max_len = 128
+tokens = tokenizer(question, 
+                   max_length=max_len, 
+                   padding='max_length', 
+                   truncation=True, 
+                   return_tensors='pt')
+
+# Move inputs to device
+question_ids = tokens['input_ids'].to(device)           # shape: [1, max_len]
+question_mask = tokens['attention_mask'].to(device)    # shape: [1, max_len]
+
+# Adjust mask shape if your model expects (batch, 1, 1, seq_len)
+question_mask = question_mask.unsqueeze(1).unsqueeze(1)  # shape: [1, 1, 1, max_len]
+
+# Generate output using your transformer
+sentence = evaluate(transformer, question_ids, question_mask, int(max_len), word_map1)
+print(sentence)
+
