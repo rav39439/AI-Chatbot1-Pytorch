@@ -1,4 +1,729 @@
 
+!---------------------------working-------------------------------------------------------
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from collections import defaultdict
+import string
+import tensorflow as tf
+import re
+import os
+import time
+from tensorflow import keras
+from tensorflow.keras.layers import Dense, Input
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.models import Model
+from tensorflow.keras.callbacks import ModelCheckpoint
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.model_selection import train_test_split
+
+ENCODER_LEN = 200
+DECODER_LEN = 70
+import tensorflow as tf
+import numpy as np
+import re
+
+# -------------------------
+# Parameters
+# -------------------------
+
+SEQ_LEN = 64     # numbe f tokens in decoder input (window size for model 
+WINDOW = SEQ_LEN + 1    # we =create windows of length SEQ_LEN+1 then split to input/target
+BATCH_SIZE = 32
+BUFFER_SIZE = 20000
+EMBED_DIM = 128
+NUM_HEADS = 8
+DFF = 512
+NUM_LAYERS = 4
+DROPOUT = 0.1
+EPOCHS = 2
+LR = 3e-4
+TILE_N =16    # number of rows in a sequence tile (queries or keys)
+TILE_D = 16    # head dimension
+CHUNK_D = 16   # inner reduction chunk (small to drive tensor cores). Must divide TILE_D (64
+
+DATA_CSV_PATH = "/kaggle/input/news-summarization/data.csv"   # adjust if different
+NUM_SAMPLES = 10000       # how many rows to use (set smaller for quick tests)
+VOCAB_SIZE = 50000          # max vocabulary size (see discussion above)
+NUM_HEADS = 8
+FF_DIM = 1024                # feed-forward layer size
+CHECKPOINT_DIR = "/kaggle/working/checkpoints"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+TOKENIZER_PATH = "/kaggle/working/tokenizer.json"
+JSONL_PATH = "/kaggle/working/summarization_instructions.jsonl"
+
+
+import tensorflow as tf
+import numpy as np
+import math
+
+import torch
+import triton
+import triton.language as tl
+
+# --------------------------
+# Config / tile siz
+# --------------------------
+
+# TILE_N = 64
+# TILE_D = 32
+# CHUNK_D = 32
+
+def get_angles(pos, i, d_model):
+    angle_rates = 1 / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
+    return pos * angle_rates
+
+def positional_encoding(position, d_model):
+    angle_rads = get_angles(np.arange(position)[:, np.newaxis],
+                            np.arange(d_model)[np.newaxis, :],
+                            d_model)
+    angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
+    angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
+    pos_encoding = angle_rads[np.newaxis, ...].astype(np.float32)  # (1, position, d_model)
+    return tf.constant(pos_encoding)  # shape (1, position, d_model)
+
+def create_look_ahead_mask(size):
+    # 1's for future positions (to be masked), 0's for allowed positions
+    mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
+    return mask  # (seq_len, seq_len)
+
+# ----------------------
+# ALiBi helpers
+# ----------------------
+def get_alibi_slopes(n_heads: int):
+    def get_slopes_power_of_2(n):
+        start = 2 ** (-2 ** -(math.log2(n) - 3))
+        ratio = start
+        return [start * (ratio ** i) for i in range(n)]
+    if math.log2(n_heads).is_integer():
+        slopes = get_slopes_power_of_2(n_heads)
+    else:
+        m = 1 << (math.ceil(math.log2(n_heads)))
+        slopes = get_slopes_power_of_2(m)
+        slopes = slopes[:n_heads]
+    return tf.constant(slopes, dtype=tf.float32)  # (n_heads,)
+
+def build_alibi_bias(n_heads: int, seq_len: int):
+    slopes = get_alibi_slopes(n_heads)  # (n_heads,)
+    idxs = tf.range(seq_len, dtype=tf.int32)
+    dist = tf.cast(tf.expand_dims(idxs, 1) - tf.expand_dims(idxs, 0), tf.float32)  # (seq_len, seq_len)
+    bias = -tf.reshape(slopes, (n_heads, 1, 1)) * tf.reshape(dist, (1, seq_len, seq_len))  # (n_heads, seq_len, seq_len)
+    return bias
+
+# ----------------------
+# Naive causal self-attention (TensorFlow)
+# Q,K,V shapes: (batch, heads, seq_len, head_dim)
+# ----------------------
+def causal_self_attention_naive(Q, K, V, alibi_bias=None, mask_future=True):
+    d = tf.cast(tf.shape(Q)[-1], tf.float32)  # head dimension
+    scores = tf.matmul(Q, K, transpose_b=True) / tf.math.sqrt(d)  # (B, H, L, L)
+
+    if alibi_bias is not None:
+        # alibi_bias: (H, L, L) -> expand to (1, H, L, L)
+        scores += tf.expand_dims(alibi_bias, 0)
+
+    if mask_future:
+        L = tf.shape(Q)[2]
+        # lower triangular (including diagonal) -> 1 for allowed
+        lower = tf.linalg.band_part(tf.ones((L, L)), -1, 0)
+        mask = 1.0 - lower  # 1 for future tokens
+        mask = tf.reshape(mask, (1, 1, L, L))  # (1,1,L,L)
+        scores = scores - 1e9 * mask
+
+    attn = tf.nn.softmax(scores, axis=-1)  # (B,H,L,L)
+    out = tf.matmul(attn, V)               # (B,H,L,head_dim)
+    return out
+
+import torch
+import tensorflow as tf
+
+@triton.jit
+def attention_tile_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    out_ptr,
+    N, D, num_tiles,
+    TILE_N: tl.constexpr, TILE_D: tl.constexpr, CHUNK_D: tl.constexpr
+):
+    pid_bh = tl.program_id(0)  # batch*head
+    pid_tq = tl.program_id(1)  # tile along sequence N
+
+    # -------------------------------
+    # Compute row indices for this til
+    # -------------------------------
+    start_q = pid_tq * TILE_N
+    rn = start_q + tl.arange(0, TILE_N)[:, None]  # (TILE_N,1)
+    cd = tl.arange(0, TILE_D)[None, :]            # (1, TILE_D)
+    q_mask = (rn < N) & (cd < D)
+
+    # -------------------------------
+    # Step 1 & 2: Load Q/K tiles and compute Q@Kᵀ
+    # -------------------------------
+    acc = tl.zeros((TILE_N, TILE_N), dtype=tl.float32)
+
+    for d_off in range(0, TILE_D, CHUNK_D):
+        cd_sub = d_off + tl.arange(0, CHUNK_D)[None, :]
+        mask_sub = (rn < N) & (cd_sub < D)
+
+        q_sub = tl.load(Q_ptr + pid_bh * N * D + rn * D + cd_sub, mask=mask_sub, other=0.0).to(tl.float16)
+        k_sub = tl.load(K_ptr + pid_bh * N * D + rn * D + cd_sub, mask=mask_sub, other=0.0).to(tl.float16)
+
+        q_f32 = q_sub.to(tl.float32)
+        k_f32 = k_sub.to(tl.float32)
+
+        partial = tl.sum(q_f32[:, None, :] * k_f32[None, :, :], axis=2)
+        # partial = tl.sum((q_sub[:, None, :] * k_sub[None, :, :]).to(tl.float32), axis=2)
+
+        acc += partial
+    # acc = acc.to(tl.float32)
+
+    # -------------------------------
+    # Step 3: Online row-wise softma
+    # ------------------------------
+    row_max = tl.max(acc, axis=1)
+    exp_tile = tl.exp(acc - row_max[:, None])
+    row_sum = tl.sum(exp_tile, axis=1)
+    softmax_tile = exp_tile / row_sum[:, None]  # shape (TILE_N, TILE_N)
+
+    # -------------------------------
+    # Step 4: Multiply with V
+    # -------------------------------
+    # accumulator for output tile
+    out_tile = tl.zeros((TILE_N, TILE_D), dtype=tl.float32)
+
+    for d_off in range(0, D, CHUNK_D):
+        cd_sub = d_off + tl.arange(0, CHUNK_D)[None, :]
+        mask_sub = (rn < N) & (cd_sub < D)
+
+        v_sub = tl.load(V_ptr + pid_bh * N * D + rn * D + cd_sub, mask=mask_sub, other=0.0).to(tl.float16)
+        v_f32 = v_sub.to(tl.float32)  # (TILE_N, CHUNK_D)
+
+        # Multiply softmax_tile (TILE_N × TILE_N) with V_chunk (TILE_N × CHUNK_D)
+        # Result: TILE_N × CHUNK_D
+        out_tile += tl.dot(softmax_tile, v_f32)  # Triton supports dot on small tiles
+
+    # out_tile = out_tile.to(tl.float32)
+
+    # -------------------------------
+    # Store final output tile
+    # -------------------------------
+    out_idx = pid_bh * num_tiles * TILE_N * D \
+             + pid_tq * TILE_N * D \
+             + rn * D + cd  # linear offsets
+    mask_out = (rn < N) & (cd < D)
+    # tl.store(out_ptr + out_idx, out_tile, mask=mask_out)
+    tl.store(out_ptr + out_idx, out_tile.to(tl.float16), mask=mask_out)
+
+
+
+def flashattention_triton(q_tf, k_tf, v_tf, TILE_N=16, TILE_D=16, CHUNK_D=16):
+    """
+    q_tf, k_tf, v_tf : TensorFlow tensors with shape (B, H, N, D) and dtype float16 (or convertible)
+    Returns TensorFlow tensor with shape (B, H, N, D) dtype float32 (matches kernel stores).
+    """
+    # print("r1")
+
+    # Convert TF -> NumPy -> Torch (CUDA). Keep dtype consistent
+    q = torch.as_tensor(q_tf.numpy(), device='cuda').to(dtype=torch.float16)
+    k = torch.as_tensor(k_tf.numpy(), device='cuda').to(dtype=torch.float16)
+    v = torch.as_tensor(v_tf.numpy(), device='cuda').to(dtype=torch.float16)
+    # print("shapes")
+    # print(q_tf)
+    # print(q_tf.shape)
+    # print(k_tf)
+    # print(v_tf)
+    # q = torch.utils.dlpack.from_dlpack(tf.experimental.dlpack.to_dlpack(q_tf)).to(dtype=torch.float16).contiguous()
+    # k = torch.utils.dlpack.from_dlpack(tf.experimental.dlpack.to_dlpack(k_tf)).to(dtype=torch.float16).contiguous()
+    # v = torch.utils.dlpack.from_dlpack(tf.experimental.dlpack.to_dlpack(v_tf)).to(dtype=torch.float16).contiguous()
+    # # print("r2")
+
+    B, H, N, D = q.shape
+    BH = B * H
+   
+    num_tiles = (N + TILE_N - 1) // TILE_N
+    padded_N = num_tiles * TILE_N   # may be >= N
+
+    # Flatten B*H and pad sequence length if needed
+    # print("r3")
+
+    q_flat = q.reshape(BH, N, D)
+    k_flat = k.reshape(BH, N, D)
+    v_flat = v.reshape(BH, N, D)
+
+    # print("r4")
+ 
+
+    # If padded_N > N, we must creat padded tensors (kernel reads up to rn < N via mask, so reading outside bounds is avoided,
+    # but easier to pass tensors with shape (BH, padded_N, D) so store layout matches)
+    if padded_N != N:
+        # create padded views with zeros for rows N..padded_N-1
+        q_pad = torch.zeros((BH, padded_N, D), device='cuda', dtype=q_flat.dtype)
+        k_pad = torch.zeros((BH, padded_N, D), device='cuda', dtype=k_flat.dtype)
+        v_pad = torch.zeros((BH, padded_N, D), device='cuda', dtype=v_flat.dtype)
+        q_pad[:, :N, :] = q_flat
+        k_pad[:, :N, :] = k_flat
+        v_pad[:, :N, :] = v_flat
+        q_flat = q_pad
+        k_flat = k_pad
+        v_flat = v_pad
+    else:
+        # ensure contiguous
+        q_flat = q_flat.contiguous()
+        k_flat = k_flat.contiguous()
+        v_flat = v_flat.contiguous()
+
+    # print("r5")
+
+
+    # Allocate output as (BH, padded_N, D) in float32 (kernel stores float32
+    # out_flat = torch.zeros((BH, padded_N, D), device='cuda', dtype=torch.float16, requires_grad=False).contiguous()
+    out_flat = torch.zeros((BH, padded_N, D), device='cuda', dtype=torch.float32, requires_grad=False).contiguous()
+
+    # print("r6")
+
+
+
+    # Triton kernel grid: (BH, num_tiles)
+    grid = (BH, num_tiles)
+
+    # print("r7")
+
+
+    # Call Triton kernel.
+    # NOTE: attention_tile_kernel must be the Triton function you posted earlier (or the corrected chunking version).
+    # Triton accepts torch tensors as args and will get underlying pointers automatically.
+    attention_tile_kernel[grid](
+        q_flat, k_flat, v_flat,
+        out_flat,
+        N, D, num_tiles,
+        TILE_N, TILE_D, CHUNK_D
+    )
+
+    # print("r8")
+
+
+    out_sliced = out_flat[:, :N, :].reshape(B, H, N, D)
+    # out_tf = tf.convert_to_tensor(out_sliced.cpu().numpy(), dtype=tf.float32)
+    # # out_tf = tf.experimental.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(out_flat[:, :N, :].reshape(B,H,N,D)))
+    # out_torch = out_flat[:, :N, :].reshape(B, H, N, D).contiguous()  # ensure contiguous
+
+    # print("r9")
+
+
+    # Convert back to TF using DLPack (NO cpu().numpy() roundtrip)
+    # out_dlpack = torch.utils.dlpack.to_dlpack(out_torch)
+    # out_tf = tf.experimental.dlpack.from_dlpack(out_dlpack)
+
+    # print("r10")
+
+
+    # If you want float32 in TF, cast there (safe)
+    out_tf = tf.convert_to_tensor(out_sliced.cpu().numpy(), dtype=tf.float32)
+
+    # out_tf = tf.cast(out_tf, tf.float32)
+
+    # print("r11")
+
+    return out_tf
+
+# ----------------------
+# Multi-head layer with ALiBi - returns only attention output
+# ----------------------
+
+ 
+class CausalSelfAttentionWithALiBi(tf.keras.layers.Layer):
+    def __init__(self, num_heads, head_dim, use_alibi=True, **kwargs):
+        super().__init__(**kwargs)
+        assert head_dim > 0 and num_heads > 0
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.use_alibi = use_alibi
+
+    def build(self, input_shape):
+        d_model = int(input_shape[-1])
+        self.Wq = self.add_weight(name="Wq", shape=(d_model, self.num_heads * self.head_dim),
+                                  initializer="glorot_uniform")
+        self.Wk = self.add_weight(name="Wk", shape=(d_model, self.num_heads * self.head_dim),
+                                  initializer="glorot_uniform")
+        self.Wv = self.add_weight(name="Wv", shape=(d_model, self.num_heads * self.head_dim),
+                                  initializer="glorot_uniform")
+        self.Wo = self.add_weight(name="Wo", shape=(self.num_heads * self.head_dim, d_model),
+                                  initializer="glorot_uniform")
+
+    def call(self, x, mask_future=True):
+        # x: (B, L, d_model)
+        B = tf.shape(x)[0]
+        L = tf.shape(x)[1]
+        H = self.num_heads
+        D = self.head_dim
+
+        # Linear projections -> (B, L, H*D)
+        q = tf.matmul(x, self.Wq)
+        k = tf.matmul(x, self.Wk)
+        v = tf.matmul(x, self.Wv)
+
+        # reshape -> (B, L, H, D) -> transpose -> (B, H, L, D)
+        q = tf.transpose(tf.reshape(q, (B, L, H, D)), perm=[0, 2, 1, 3])
+        k = tf.transpose(tf.reshape(k, (B, L, H, D)), perm=[0, 2, 1, 3])
+        v = tf.transpose(tf.reshape(v, (B, L, H, D)), perm=[0, 2, 1, 3])
+
+        alibi_bias = None
+        if self.use_alibi:
+            # build ALiBi for this sequence (H, L, L)
+            alibi_bias = build_alibi_bias(H, L)
+
+        # Use naive (correct & graph-friendly) causal attention
+        attn_out = flashattention_triton(q, k, v, TILE_N=16, TILE_D=16, CHUNK_D=16)  # (B,H,L,D)
+
+        # transpose back and combine heads -> (B, L, H*D)
+        attn_out = tf.transpose(attn_out, perm=[0, 2, 1, 3])
+        attn_out = tf.reshape(attn_out, (B, L, H * D))
+
+        # final linear
+        out = tf.matmul(attn_out, self.Wo)  # (B, L, d_model)
+        return out
+        
+   
+
+# ----------------------
+# Feed-forward network
+# ----------------------
+def point_wise_feed_forward_network(d_model, dff):
+    return tf.keras.Sequential([
+        tf.keras.layers.Dense(dff, activation=tf.nn.gelu),
+        tf.keras.layers.Dense(d_model)
+    ])
+
+# ----------------------
+# Decoder-only Transformer Layer
+# ----------------------
+class DecoderOnlyLayer(tf.keras.layers.Layer):
+    def __init__(self, d_model, num_heads, dff, rate=0.05, **kwargs):
+        super().__init__(**kwargs)
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        head_dim = d_model // num_heads
+
+        self.mha = CausalSelfAttentionWithALiBi(num_heads=num_heads, head_dim=head_dim, use_alibi=True)
+        self.ffn = point_wise_feed_forward_network(d_model, dff)
+
+        self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+
+        self.dropout1 = tf.keras.layers.Dropout(rate)
+        self.dropout2 = tf.keras.layers.Dropout(rate)
+
+    def call(self, x, training=False, look_ahead_mask=None):
+        # Pre-norm (LayerNorm before attention)
+        x_norm = self.layernorm1(x)
+
+        # pass mask_future flag if look_ahead_mask is provided (we only support causal mask for now)
+        mask_future = True if look_ahead_mask is None else True
+        attn_output = self.mha(x_norm, mask_future=mask_future)  # (B, L, d_model)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = x + attn_output
+
+        out1_norm = self.layernorm2(out1)
+        ffn_output = self.ffn(out1_norm)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        out2 = out1 + ffn_output
+        return out2
+
+# ----------------------
+# Decoder-only Transformer model
+# ----------------------
+class DecoderOnlyTransformer(tf.keras.Model):
+    def __init__(self, num_layers, d_model, num_heads, dff, vocab_size, maximum_position_encoding, rate=0.05):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_layers = num_layers
+
+        self.embedding = tf.keras.layers.Embedding(vocab_size, d_model)
+        self.pos_encoding = positional_encoding(maximum_position_encoding, d_model)
+
+        self.dec_layers = [DecoderOnlyLayer(d_model, num_heads, dff, rate) for _ in range(num_layers)]
+        self.dropout = tf.keras.layers.Dropout(rate)
+        self.final_layer = tf.keras.layers.Dense(vocab_size)
+
+    def call(self, x, training=False, look_ahead_mask=None):
+        seq_len = tf.shape(x)[1]
+        x = self.embedding(x)  # (B, seq_len, d_model)
+        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        x = x + self.pos_encoding[:, :seq_len, :]
+
+        x = self.dropout(x, training=training)
+
+        for i in range(self.num_layers):
+            x = self.dec_layers[i](x, training=training, look_ahead_mask=look_ahead_mask)
+
+        logits = self.final_layer(x)  # (B, seq_len, vocab_size)
+        return logits
+
+import os
+import json
+import math
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+
+# ---------------------------
+# Config / Hyperparams
+# ----------------------------
+# ----------------------------
+# 1) Load CSV and create instruction JSONL file
+# ----------------------------
+df = pd.read_csv('/kaggle/input/news-summarization/data.csv')
+df = df.dropna(subset=["Content","Summary"])   # ensure text and summary exist
+df = df.reset_index(drop=True)
+df = df.head(NUM_SAMPLES)
+
+# Write JSONL in instruction format
+with open(JSONL_PATH, "w", encoding="utf-8") as out:
+    for _, row in df.iterrows():
+        item = {"instruction":"summarization", "input": row["Content"], "output": row["Summary"]}
+        out.write(json.dumps(item, ensure_ascii=False) + "\n")
+print("Wrote JSONL:", JSONL_PATH)
+
+
+
+from transformers import BertTokenizerFast
+
+# Load pretrained BERT tokenizer (WordPiece, 30k vocab)
+tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
+
+print("Loaded BERT vocab size:", tokenizer.vocab_size)
+
+def make_sequence_from_example(inp_text, out_text, tokenizer, seq_len):
+    combined = f"[CLS] summarization: {inp_text} [SEP] {out_text} [SEP]"
+    encoded = tokenizer.encode(
+        combined,
+        max_length=seq_len,
+        truncation=True,
+        padding='max_length'
+    )
+    return encoded
+
+
+X_all = []
+Y_all = []
+
+with open(JSONL_PATH, "r", encoding="utf-8") as f:
+    for line in f:
+        ex = json.loads(line)
+        seq = make_sequence_from_example(ex["input"], ex["output"], tokenizer, SEQ_LEN)
+
+        # Shift for next-token prediction
+        X_all.append(seq[:-1])  
+        Y_all.append(seq[1:])
+
+X_all = np.array(X_all, dtype=np.int32)
+Y_all = np.array(Y_all, dtype=np.int32)
+print("Sequences shape (inputs):", X_all.shape, "targets:", Y_all.shape)
+
+# Build tf.data.Dataset
+dataset = tf.data.Dataset.from_tensor_slices((X_all, Y_all))
+dataset = dataset.shuffle(2048).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+effective_vocab_size = tokenizer.vocab_size
+print(effective_vocab_size)
+
+
+model = DecoderOnlyTransformer(
+    num_layers=NUM_LAYERS,
+    d_model=EMBED_DIM,
+    num_heads=NUM_HEADS,
+    dff=FF_DIM,
+    vocab_size=effective_vocab_size,
+    maximum_position_encoding=SEQ_LEN,
+    rate=0.1
+)
+
+# ------------------------
+# CHECKPOINT SETU
+# ------------------------
+import shutil
+# src ="/kaggle/input/test-model-test2"
+# dst = "/kaggle/working/test-model-test2"
+# shutil.copytree(src, dst, dirs_exist_ok=True)
+checkpoint_path = "/kaggle/working/transformer_epoch_{epoch:22b}.weights.h5"
+checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+    checkpoint_path,
+    save_weights_only=True,
+    monitor='loss',
+    verbose=1,
+    save_freq='epoch'
+)
+
+dummy_inp = tf.random.uniform((1, SEQ_LEN), dtype=tf.int64, minval=0, maxval=200) 
+dummy_tar = tf.random.uniform((1, SEQ_LEN), dtype=tf.int64, minval=0, maxval=200) 
+_ = logits = model(dummy_inp, training=False) # ====== STEP 2: Load Pretrained Weights ====== 
+model.load_weights("/kaggle/input/testmodel/smodel.weights.h5")
+print("checkpoint has successfully loade")
+
+class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, d_model, warmup_steps=4000):
+        super().__init__()
+        self.d_model = tf.cast(d_model, tf.float32)
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        arg1 = tf.math.rsqrt(step)
+        arg2 = step * (self.warmup_steps ** -1.5)
+        return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
+
+
+# lr = CustomSchedule(EMBED_DI
+loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+optimizer = tf.keras.optimizers.Adam(learning_rate=LR)
+
+# model.compile(optimizer=optimizer, loss=loss_fn, metrics=['sparse_categorical_accuracy'], run_eagerly=True)
+
+# # # model.fit(dataset, epochs=EPOCHS, callbacks=[checkpoint_cb])
+# model.fit(dataset, epochs=EPOCHS)
+
+# -------------------------
+# SAVE WEIGHT
+# -------------------------
+# model.save_weights(checkpoint_path)
+print("✅ Model training complete and weights saved")
+
+# -------------------------
+# TEXT GENERATION FUNCTIO
+# -------------------------
+# def generate_text_greedy(model, tokenizer, prompt, max_gen=50):
+#     # Encode text using HuggingFace tokenizer
+#     token_list = tokenizer.encode(f"<BOS> {prompt} <SEP>", add_special_tokens=False)
+
+#     if len(token_list) > SEQ_LEN:
+#         token_list = token_list[-SEQ_LEN:]
+
+#     input_seq = tf.expand_dims(token_list, 0)
+
+#     generated = []
+#     for _ in range(max_gen):
+#         logits = model(input_seq, training=False)
+#         next_id = tf.argmax(logits[:, -1, :], axis=-1).numpy()[0]
+
+#         # HF tokenizers don't have index_word; use convert_ids_to_tokens
+#         next_word = tokenizer.convert_ids_to_tokens([next_id])[0]
+
+#         if next_word == "<EOS>":
+#             break
+
+#         generated.append(next_word)
+
+#         # Slide window
+#         input_seq = tf.concat([input_seq[:, 1:], [[next_id]]], axis=-1)
+
+#     return generated
+
+import tensorflow as tf
+
+def generate_text_greedy_bert(model, tokenizer, prompt, max_gen=50, seq_len=128):
+    """
+    Greedy text generation using a BERT tokenizer.
+    
+    model     : TensorFlow/Keras model
+    tokenizer : BertTokenizerFast
+    prompt    : initial text prompt
+    max_gen   : max number of tokens to generate
+    seq_len   : max sequence length (window)
+    """
+    # Encode prompt with BERT tokenizer
+    # Include [CLS] at start and [SEP] at end
+    token_list = tokenizer.encode(f"{prompt}", add_special_tokens=True)
+    
+    # Truncate to max sequence length
+    if len(token_list) > seq_len:
+        token_list = token_list[-seq_len:]
+    
+    # Create batch dimension
+    input_seq = tf.expand_dims(token_list, 0)  # (1, seq_len)
+    
+    generated = []
+    
+    for _ in range(max_gen):
+        # Get model logits
+        logits = model(input_seq, training=False)  # (1, seq_len, vocab_size)
+        
+        # Pick the last token's logits
+        next_id = tf.argmax(logits[:, -1, :], axis=-1).numpy()[0]
+        
+        # Convert token ID to string
+        next_word = tokenizer.convert_ids_to_tokens([next_id])[0]
+        
+        # Stop if [SEP] is generated
+        if next_word == tokenizer.sep_token:
+            break
+        
+        # Append generated token
+        generated.append(next_word)
+        
+        # Slide window: append next token to input_seq
+        input_seq = tf.concat([input_seq[:, 1:], [[next_id]]], axis=-1)
+    
+    # Convert tokens to a readable string
+    generated_text = tokenizer.convert_tokens_to_string(generated)
+    
+    return prompt + " " + generated_text
+
+
+# -------------------------
+# EXAMPLE GENERATIO
+# -------------------------
+prompt = "Summarize: New York police are concerned drones could become tools for terrorists."
+
+generated_text = generate_text_greedy_bert(model, tokenizer, prompt, max_gen=60, seq_len=128)
+print(generated_text)
+
+
+
+# # # import kagglehub
+
+# # # # Download latest version
+# # # path = kagglehub.dataset_download("sbhatti/news-summarization")
+
+# # # print("Path to dataset files:", path)
+
+
+
+# import torch, inspect, os
+# print(torch.__file__)
+# print(os.listdir('.'))
+
+# embedding = torch.nn.Embedding(num_embeddings=1000, embedding_dim=64)
+# idx = torch.tensor([3, 7, 12])   # word IDs
+# out = embedding(idx)
+# print(out)
+
+# x = torch.randn(10, 5, 3)
+
+# print(x)
+
+# c=torch.arange(0, 10, step=2)
+# print(c)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+1------------------------------------not working-------------------------------------------------
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
