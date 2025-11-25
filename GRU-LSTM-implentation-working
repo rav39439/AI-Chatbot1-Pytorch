@@ -139,6 +139,100 @@ def recommend_next_products(model, user_seq, top_k=5):
     return le.inverse_transform(top_products_idx)
 
 
+#------------------------------lstm in place of GRU------------------------------
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import LSTM, Dense, Embedding, Input
+
+# Split features
+product_ids = X_pad[:,:,0]
+category_ids = X_pad[:,:,1]
+category_codes = X_pad[:,:,2]
+brands = X_pad[:,:,3]
+prices = X_pad[:,:,4]
+
+VOCAB_SIZE_PRODUCT = df['product_id'].nunique()
+VOCAB_SIZE_CATEGORY = df['category_id'].nunique()
+VOCAB_SIZE_CATEGORY_CODE = df['category_code'].nunique()
+VOCAB_SIZE_BRAND = df['brand'].nunique()
+
+EMB_SIZE = 32
+
+# Inputs
+input_product = Input(shape=(MAX_SEQ_LEN,))
+input_category = Input(shape=(MAX_SEQ_LEN,))
+input_catcode = Input(shape=(MAX_SEQ_LEN,))
+input_brand = Input(shape=(MAX_SEQ_LEN,))
+input_price = Input(shape=(MAX_SEQ_LEN,1))
+
+# Embeddings
+embed_product = Embedding(VOCAB_SIZE_PRODUCT+1, EMB_SIZE)(input_product)
+embed_category = Embedding(VOCAB_SIZE_CATEGORY+1, EMB_SIZE)(input_category)
+embed_catcode = Embedding(VOCAB_SIZE_CATEGORY_CODE+1, EMB_SIZE)(input_catcode)
+embed_brand = Embedding(VOCAB_SIZE_BRAND+1, EMB_SIZE)(input_brand)
+
+# Concatenate all features
+x = tf.keras.layers.Concatenate()([
+    embed_product,
+    embed_category,
+    embed_catcode,
+    embed_brand,
+    input_price
+])
+
+# 🔥 LSTM layer (replacing GRU)
+x = LSTM(128, return_sequences=False)(x)
+
+# Output layer
+output = Dense(VOCAB_SIZE_PRODUCT, activation='softmax')(x)
+
+model = Model(
+    inputs=[input_product, input_category, input_catcode, input_brand, input_price],
+    outputs=output
+)
+
+model.compile(
+    optimizer='adam',
+    loss='sparse_categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+model.summary()
+# Step 5: Train the Model
+# Reshape prices to 3D
+input_price = prices.reshape(prices.shape[0], prices.shape[1], 1)
+
+model.fit([product_ids, category_ids, category_codes, brands, input_price],
+          y,
+          batch_size=64,
+          epochs=90,
+          validation_split=0.1)
+
+
+def recommend_next_products(model, user_seq, top_k=5):
+    # Pad user sequence
+    seq_padded = pad_multi_features([user_seq], MAX_SEQ_LEN)
+    product_ids = seq_padded[:,:,0]
+    category_ids = seq_padded[:,:,1]
+    category_codes = seq_padded[:,:,2]
+    brands = seq_padded[:,:,3]
+    prices = seq_padded[:,:,4].reshape(1, MAX_SEQ_LEN, 1)
+    
+    preds = model.predict([product_ids, category_ids, category_codes, brands, prices])[0]
+    top_products_idx = preds.argsort()[-top_k:][::-1]
+    
+    # Convert back to original product IDs
+    le = label_encoders['product_id']
+    return le.inverse_transform(top_products_idx)
+
+
+# Example
+user_example = user_sequences[list(user_sequences.keys())[0]]
+recommend_next_products(model, user_example)
+
+
+#---------------------------------------------------------------------------------
+
 # Example
 user_example = user_sequences[list(user_sequences.keys())[0]]
 recommend_next_products(model, user_example)
