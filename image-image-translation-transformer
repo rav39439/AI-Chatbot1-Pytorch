@@ -108,40 +108,56 @@ import torch
 import torch.nn as nn
 import math
 
+import torch
+import torch.nn as nn
+import math
+
 class PositionalEncoding(nn.Module):
-    def __init__(self, embed_dim=256, grid_size=16):
+    def __init__(self, num_patches=4096, embed_dim=256):
         """
-        grid_size = H = W = sqrt(num_patches)
-        embed_dim must be divisible by 4 for 2D split
+        Learnable 2D positional encoding for patch embeddings.
+        embed_dim must be divisible by 2.
         """
         super().__init__()
         self.embed_dim = embed_dim
-        
-        # separate row and column embeddings
-        self.row_embed = nn.Parameter(torch.zeros(1, grid_size, embed_dim // 2))
-        self.col_embed = nn.Parameter(torch.zeros(1, grid_size, embed_dim // 2))
-        
-        # Xavier init = MUCH more stable
+        # Number of patches along one dimension (H=W)
+        self.num_patches = num_patches
+        self.grid_size = int(math.sqrt(num_patches))
+        assert self.grid_size**2 == num_patches, "num_patches must be a perfect square"
+        assert embed_dim % 2 == 0, "embed_dim must be divisible by 2"
+
+        # Learnable row and column embeddings
+        self.row_embed = nn.Parameter(torch.zeros(1, self.grid_size, embed_dim // 2))
+        self.col_embed = nn.Parameter(torch.zeros(1, self.grid_size, embed_dim // 2))
+
+        # Xavier init
         nn.init.xavier_uniform_(self.row_embed)
         nn.init.xavier_uniform_(self.col_embed)
 
     def forward(self, x):
+        # x: (B, N, D)
         B, N, D = x.shape
         H = W = int(math.sqrt(N))
+        x = x.view(B, H, W, D)  # reshape to 2D
 
-        # reshape (B, H, W, embed)
-        x = x.view(B, H, W, D)
-
-        # row_embed: (1, H, D/2) → expand to (B, H, W, D/2)
-        # col_embed: (1, W, D/2) → expand to (B, H, W, D/2)
+        # expand row and column embeddings
         pos = torch.cat([
-            self.row_embed[:, :, None, :].expand(B, -1, W, -1),
-            self.col_embed[:, None, :, :].expand(B, H, -1, -1)
+            self.row_embed[:, :, None, :].expand(B, H, W, D // 2),
+            self.col_embed[:, None, :, :].expand(B, H, W, D // 2)
         ], dim=3)
 
-        # final shape → (B, N, D)
         x = x + pos
-        return x.view(B, N, D)
+        return x.view(B, N, D)  # flatten back to (B, N, D)
+
+
+# Example usage
+B, N, D = 4, 4096, 256  # batch, num_patches, embed_dim
+A_embed = torch.randn(B, N, D)
+
+pos_encoder = PositionalEncoding(num_patches=N, embed_dim=D)
+A_out = pos_encoder(A_embed)  # (4, 256, 256)
+print(A_out.shape)
+
 
 pos_encoder = PositionalEncoding(num_patches=4096, embed_dim=256)
 A_out = pos_encoder(A_embed)   # (4, 256, 256)
