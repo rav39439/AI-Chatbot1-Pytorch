@@ -1,0 +1,485 @@
+import os
+from PIL import Image
+import random
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms.functional as TF
+
+# --------------------------------------------------------
+# STEP 1 : Dataset Setup (Define folder paths)
+# --------------------------------------------------------
+
+dataset_root = "/kaggle/input/gopro-deblur/gopro_deblur"   # your dataset folder with blur/ and sharp/
+
+# Check folders exist
+assert os.path.exists(os.path.join(dataset_root, "blur/images")), "Blur folder missing!"
+assert os.path.exists(os.path.join(dataset_root, "sharp/images")), "Sharp folder missing!"
+
+print("Step 1: Dataset folders verified.")
+
+
+# --------------------------------------------------------
+# STEP 2 : Data Pipeline (Using your original class)
+# Only small addition: limit_to_n for testing
+# --------------------------------------------------------
+
+class PairedImageDataset(Dataset):
+    def __init__(self, root_dir, patch_size=256, augment=True, limit_to_n=None):
+        """
+        root_dir: dataset/ (contains blur/ and sharp/)
+        patch_size: training crop size
+        augment: random augmentations
+        limit_to_n: load only first N images (testing)
+        """
+        self.blur_dir = os.path.join(root_dir, "blur/images")
+        self.sharp_dir = os.path.join(root_dir, "sharp/images")
+        self.patch_size = patch_size
+        self.augment = augment
+
+        # Load image list
+        self.image_list = sorted(os.listdir(self.blur_dir))
+
+        # Limit to N samples for testing (minimal modification)
+        if limit_to_n is not None:
+            self.image_list = self.image_list[:limit_to_n]
+
+        # Folder consistency check
+        sharp_list = sorted(os.listdir(self.sharp_dir))
+        assert len(sharp_list) >= len(self.image_list), \
+            "Sharp folder has fewer images than blur folder!"
+
+    def __len__(self):
+        return len(self.image_list)
+
+    def __getitem__(self, idx):
+        blur_path = os.path.join(self.blur_dir, self.image_list[idx])
+        sharp_path = os.path.join(self.sharp_dir, self.image_list[idx])
+
+        blur = Image.open(blur_path).convert("RGB")
+        sharp = Image.open(sharp_path).convert("RGB")
+
+        # Convert to tensor
+        blur = TF.to_tensor(blur)
+        sharp = TF.to_tensor(sharp)
+
+        # Random crop (patch extraction)
+        h, w = blur.shape[1], blur.shape[2]
+        ph, pw = self.patch_size, self.patch_size
+
+        top = random.randint(0, h - ph)
+        left = random.randint(0, w - pw)
+
+        blur = blur[:, top:top+ph, left:left+pw]
+        sharp = sharp[:, top:top+ph, left:left+pw]
+
+        # Augmentations
+        if self.augment:
+            if random.random() < 0.5:
+                blur = TF.hflip(blur)
+                sharp = TF.hflip(sharp)
+
+            if random.random() < 0.5:
+                blur = TF.vflip(blur)
+                sharp = TF.vflip(sharp)
+
+            if random.random() < 0.5:
+                angle = random.choice([90, 180, 270])
+                blur = TF.rotate(blur, angle)
+                sharp = TF.rotate(sharp, angle)
+
+        return blur, sharp
+
+
+# --------------------------------------------------------
+# Load dataset (10 samples for testing)
+# --------------------------------------------------------
+
+dataset = PairedImageDataset(
+    root_dir=dataset_root,
+    patch_size=256,
+    augment=True,
+    limit_to_n=800      # only 10 images for testing
+)
+
+dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+
+print("Step 2: Data pipeline ready.")
+print("Total loaded samples:", len(dataset))
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# --------------------------------------------------------
+# Fundamental Restormer Layers
+# --------------------------------------------------------
+
+# 1. Overlapping Patch Embedding
+class OverlapPatchEmbed(nn.Module):
+    def __init__(self, in_channels=3, embed_dim=48):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+# 2. Multi-DConv-Head Transposed Attention (MDTA)
+class MDTA(nn.Module):
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+
+        self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=False)
+        self.dwconv = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, padding=1, groups=dim * 3)
+
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        qkv = self.dwconv(self.qkv(x))
+        q, k, v = qkv.chunk(3, dim=1)
+
+        q = q.reshape(b, self.num_heads, c // self.num_heads, h * w)
+        k = k.reshape(b, self.num_heads, c // self.num_heads, h * w)
+        v = v.reshape(b, self.num_heads, c // self.num_heads, h * w)
+
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
+
+        out = (attn @ v).reshape(b, c, h, w)
+        out = self.project_out(out)
+        return out
+
+
+# 3. Gated Depthwise Convolutional Feedforward Network (GDFN)
+class GDFN(nn.Module):
+    def __init__(self, dim, expansion_factor=2.66):
+        super().__init__()
+        hidden_dim = int(dim * expansion_factor)
+
+        self.project_in = nn.Conv2d(dim, hidden_dim * 2, kernel_size=1)
+        self.dwconv = nn.Conv2d(hidden_dim * 2, hidden_dim * 2, kernel_size=3, padding=1, groups=hidden_dim * 2)
+        self.project_out = nn.Conv2d(hidden_dim, dim, kernel_size=1)
+
+    def forward(self, x):
+        x_proj = self.project_in(x)
+        x_dw = self.dwconv(x_proj)
+        x1, x2 = x_dw.chunk(2, dim=1)
+        return self.project_out(x1 * F.gelu(x2))
+
+
+# 4. Restormer Block
+class RestormerBlock(nn.Module):
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.attn = MDTA(dim, num_heads)
+        self.ffn = GDFN(dim)
+
+    def forward(self, x):
+        x = x + self.attn(x)
+        x = x + self.ffn(x)
+        return x
+
+
+# --------------------------------------------------------
+# Full Encoder–Decoder Restormer
+# --------------------------------------------------------
+
+class Restormer(nn.Module):
+    def __init__(self, dim=48):
+        super().__init__()
+
+        # Patch embedding
+        self.patch_embed = OverlapPatchEmbed(3, dim)
+
+        # Encoder
+        self.encoder1 = RestormerBlock(dim)
+        self.down1 = nn.Conv2d(dim, dim * 2, 2, 2)
+
+        self.encoder2 = RestormerBlock(dim * 2)
+        self.down2 = nn.Conv2d(dim * 2, dim * 4, 2, 2)
+
+        # Bottleneck
+        self.bottleneck = RestormerBlock(dim * 4)
+
+        # Decoder
+        self.up1 = nn.ConvTranspose2d(dim * 4, dim * 2, 2, 2)
+        self.decoder1 = RestormerBlock(dim * 2)
+
+        self.up2 = nn.ConvTranspose2d(dim * 2, dim, 2, 2)
+        self.decoder2 = RestormerBlock(dim)
+
+        # Output layer
+        self.output = nn.Conv2d(dim, 3, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        # Embedding
+        x1 = self.patch_embed(x)
+
+        # Encoder
+        e1 = self.encoder1(x1)
+        x2 = self.down1(e1)
+
+        e2 = self.encoder2(x2)
+        x3 = self.down2(e2)
+
+        # Bottleneck
+        b = self.bottleneck(x3)
+
+        # Decoder
+        d1 = self.up1(b) + e2
+        d1 = self.decoder1(d1)
+
+        d2 = self.up2(d1) + e1
+        d2 = self.decoder2(d2)
+
+        out = self.output(d2)
+        return out
+
+
+# --------------------------------------------------------
+# Connect Step 3 with Step 1 and Step 2
+# --------------------------------------------------------
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model = Restormer().to(device)
+
+print("Step 3: Restormer model created.")
+print("Model parameters:", sum(p.numel() for p in model.parameters()))
+
+# Test one batch through the model
+for blur, sharp in dataloader:
+    blur = blur.to(device)
+    output = model(blur)
+    print("Input batch:", blur.shape)
+    print("Output batch:", output.shape)
+    break
+
+
+
+# --------------------------------------------------------
+# STEP 4 : Loss Functions (L1 + Charbonnier)
+# --------------------------------------------------------
+
+# Standard L1 Loss
+l1_loss = torch.nn.L1Loss()
+
+# Charbonnier Loss (used in Restormer paper)
+class CharbonnierLoss(torch.nn.Module):
+    """ Charbonnier Loss (also called L1-smooth) """
+    def __init__(self, eps=1e-3):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, prediction, target):
+        return torch.mean(torch.sqrt((prediction - target) ** 2 + self.eps ** 2))
+
+charbonnier_loss = CharbonnierLoss()
+
+print("Step 4: Loss functions initialized.")
+
+
+
+
+# --------------------------------------------------------
+# STEP 5 : Full Training Loop
+# --------------------------------------------------------
+
+num_epochs = 3      # small number for demonstration
+print_every = 1     # print loss every 1 batch
+
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+print("\nStep 5: Starting training...\n")
+
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+
+    for batch_idx, (blur, sharp) in enumerate(dataloader):
+        blur = blur.to(device)
+        sharp = sharp.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass through Restormer (from Step 3)
+        output = model(blur)
+
+        # Compute losses (from Step 4)
+        loss_l1 = l1_loss(output, sharp)
+        loss_charb = charbonnier_loss(output, sharp)
+        loss = loss_l1 + loss_charb
+
+        # Backpropagation
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+        # Print progress
+        if (batch_idx + 1) % print_every == 0:
+            print(f"Epoch [{epoch+1}/{num_epochs}] "
+                  f"Batch [{batch_idx+1}/{len(dataloader)}] "
+                  f"Loss: {loss.item():.6f}")
+
+    avg_loss = running_loss / len(dataloader)
+    print(f"Epoch {epoch+1}/{num_epochs} Completed - Avg Loss: {avg_loss:.6f}\n")
+
+print("Step 5: Training completed.")
+
+
+
+
+# --------------------------------------------------------
+# STEP 6 : Validation (PSNR + SSIM)
+# --------------------------------------------------------
+
+# PSNR function
+def calculate_psnr(img1, img2):
+    mse = torch.mean((img1 - img2) ** 2)
+    if mse == 0:
+        return 100  # identical images
+    psnr = 20 * torch.log10(1.0 / torch.sqrt(mse))
+    return psnr.item()
+
+# SSIM function (simple implementation)
+def calculate_ssim(img1, img2, C=0.01**2):
+    mu1 = img1.mean()
+    mu2 = img2.mean()
+    sigma1 = img1.var()
+    sigma2 = img2.var()
+    sigma12 = ((img1 - mu1) * (img2 - mu2)).mean()
+    
+    ssim = ((2 * mu1 * mu2 + C) * (2 * sigma12 + C)) / \
+           ((mu1**2 + mu2**2 + C) * (sigma1 + sigma2 + C))
+    return ssim.item()
+
+# Create a validation dataloader (no augmentation)
+val_dataset = PairedImageDataset(
+    root_dir=dataset_root,
+    patch_size=256,
+    augment=False,
+    limit_to_n=5  # small validation size
+)
+val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
+
+print("Step 6: Validation loader created.")
+
+
+
+
+    # --------------------------------------------------------
+    # Validation after each epoch
+    # --------------------------------------------------------
+    model.eval()
+    avg_psnr, avg_ssim = 0, 0
+
+    with torch.no_grad():
+        for blur, sharp in val_loader:
+            blur = blur.to(device)
+            sharp = sharp.to(device)
+
+            output = model(blur)
+
+            psnr = calculate_psnr(output.clamp(0,1), sharp)
+            ssim = calculate_ssim(output.clamp(0,1), sharp)
+
+            avg_psnr += psnr
+            avg_ssim += ssim
+
+    avg_psnr /= len(val_loader)
+    avg_ssim /= len(val_loader)
+
+    print(f"Validation Results → PSNR: {avg_psnr:.3f}  SSIM: {avg_ssim:.3f}\n")
+
+
+
+
+    # --------------------------------------------------------
+    # STEP 7 : Save checkpoints
+    # --------------------------------------------------------
+    checkpoint_path = f"checkpoint_epoch_{epoch+1}.pth"
+    torch.save({
+        "epoch": epoch+1,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }, checkpoint_path)
+
+    print(f"Step 7: Checkpoint saved → {checkpoint_path}\n")
+
+
+
+
+import os
+import torch
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import torchvision.transforms.functional as TF
+import matplotlib.pyplot as plt
+
+# -------------------------------
+# Device
+# -------------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# -------------------------------
+# Dataset for 6 images
+# -------------------------------
+class DemoDataset(Dataset):
+    def __init__(self, root_dir, limit=6):
+        self.blur_dir = os.path.join(root_dir, "blur/images")
+        self.image_list = sorted(os.listdir(self.blur_dir))[:limit]
+
+    def __len__(self):
+        return len(self.image_list)
+
+    def __getitem__(self, idx):
+        blur_path = os.path.join(self.blur_dir, self.image_list[idx])
+        blur = Image.open(blur_path).convert("RGB")
+        blur_tensor = TF.to_tensor(blur)
+        return blur_tensor, self.image_list[idx]
+
+dataset_demo = DemoDataset(root_dir="/kaggle/input/gopro-deblur/gopro_deblur", limit=6)
+demo_loader = DataLoader(dataset_demo, batch_size=1, shuffle=False)
+
+# -------------------------------
+# Load trained model
+# -------------------------------
+model = Restormer().to(device)
+checkpoint_path = "checkpoint_epoch_3.pth"  # your trained model path
+checkpoint = torch.load(checkpoint_path, map_location=device)
+model.load_state_dict(checkpoint["model_state_dict"])
+model.eval()
+print(f"Loaded trained model from {checkpoint_path}")
+
+# -------------------------------
+# Inference & display 6 images
+# -------------------------------
+with torch.no_grad():
+    for blur, filename in demo_loader:
+        blur = blur.to(device)
+        output = model(blur).clamp(0,1)
+
+        blur_np = blur[0].cpu().permute(1,2,0).numpy()
+        output_np = output[0].cpu().permute(1,2,0).numpy()
+
+        plt.figure(figsize=(10,5))
+        plt.suptitle(filename[0])
+        
+        plt.subplot(1,2,1)
+        plt.imshow(blur_np)
+        plt.title("Blur Image")
+        plt.axis("off")
+        
+        plt.subplot(1,2,2)
+        plt.imshow(output_np)
+        plt.title("Restored Image")
+        plt.axis("off")
+        
+        plt.show()
