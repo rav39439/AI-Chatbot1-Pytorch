@@ -1,0 +1,567 @@
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import torchvision.transforms as T
+
+# ================================================================
+# STEP 2: DATA PREPARATION FOR TRANSUNET
+# ==============================================================
+
+transform_step2 = T.Compose([
+    T.Resize((224, 224)),
+    T.ToTensor(),
+    T.Normalize(
+        mean=[0.485, 0.456, 0.406],   # ImageNet mean
+        std=[0.229, 0.224, 0.225]     # ImageNet std
+    )
+])
+
+
+class CatDogTransUNetDataset(Dataset):
+    def __init__(self, root_dir, transforms=None):
+        self.dir_A = os.path.join(root_dir, "trainA")
+        self.dir_B = os.path.join(root_dir, "trainB")
+
+        self.A_images = sorted(os.listdir(self.dir_A))
+        self.B_images = sorted(os.listdir(self.dir_B))
+
+        self.transforms = transforms
+
+    def __len__(self):
+        return min(len(self.A_images), len(self.B_images))
+
+    def load_image(self, path):
+        img = Image.open(path).convert("RGB")
+        if self.transforms:
+            img = self.transforms(img)
+        return img
+
+    def __getitem__(self, idx):
+        imgA_path = os.path.join(self.dir_A, self.A_images[idx])
+        imgB_path = os.path.join(self.dir_B, self.B_images[idx])
+
+        A = self.load_image(imgA_path)
+        B = self.load_image(imgB_path)
+
+        return A, B
+
+
+# ================================================================
+# STEP 3: PATCH EMBEDDING (ViT-Style for TransUNet)
+# ==============================================================
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768):
+        super().__init__()
+
+        self.num_patches = (img_size // patch_size) ** 2
+
+        self.proj = nn.Conv2d(
+            in_channels,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size
+        )
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+
+    def forward(self, x):
+        # Input: (B, 3, 224, 224)
+        B = x.size(0)
+
+        # (B, embed_dim, 14, 14)
+        x = self.proj(x)
+
+        # Flatten to (B, 196, embed_dim)
+        x = x.flatten(2).transpose(1, 2)
+
+        # Add position embedding
+        x = x + self.pos_embed
+
+        return x
+
+
+# ================================================================
+# TESTING BOTH STEPS
+# ==============================================================
+
+if __name__ == "__main__":
+    # ----- Test Step 2 -----
+    dataset = CatDogTransUNetDataset("/kaggle/input/cat2dog/cat2dog", transforms=transform_step2)
+    loader = DataLoader(dataset, batch_size=2, shuffle=True)
+
+    A, B = next(iter(loader))
+    print("Step 2 Test:")
+    print("A batch:", A.shape)   # torch.Size([2, 3, 224, 224])
+    print("B batch:", B.shape)   # torch.Size([2, 3, 224, 224])
+
+    # ----- Test Step 3 -----
+    patch_embed = PatchEmbedding()
+
+    A_patches = patch_embed(A)
+    print("\nStep 3 Test:")
+    print("Patch embedding output:", A_patches.shape)
+    # Expected shape: [batch, 196 patches, 768 dim]
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ---------------------------------------------------------------
+# STEP 4: TRANSFORMER ENCODER (VIT)
+# ---------------------------------------------------------------
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, embed_dim=768, num_heads=12, mlp_dim=3072, dropout=0.1):
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, mlp_dim),
+            nn.GELU(),
+            nn.Linear(mlp_dim, embed_dim)
+        )
+
+    def forward(self, x):
+        # x shape = (batch, num_patches, embed_dim)
+
+        # Self-Attention block
+        x2 = self.norm1(x)
+        x_attn, _ = self.attn(x2, x2, x2)  
+        x = x + x_attn  # residual
+
+        # MLP feed-forward block
+        x2 = self.norm2(x)
+        x_mlp = self.mlp(x2)
+        x = x + x_mlp  # residual
+
+        return x
+
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, depth=12, embed_dim=768):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(embed_dim=embed_dim)
+            for _ in range(depth)
+        ])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+# ---------------------------------------------------------------
+# STEP 5: CNN ENCODER + SKIP CONNECTIONS
+# ---------------------------------------------------------------
+
+class CNNEncoder(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        def conv_block(in_c, out_c):
+            return nn.Sequential(
+                nn.Conv2d(in_c, out_c, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm2d(out_c),
+                nn.ReLU(inplace=True)
+            )
+
+        # Stage 1 (224 → 224)
+        self.stage1 = nn.Sequential(
+            conv_block(in_channels, 64),
+            conv_block(64, 64)
+        )
+        self.pool1 = nn.MaxPool2d(2)  # 224 → 112
+
+        # Stage 2 (112 → 112)
+        self.stage2 = nn.Sequential(
+            conv_block(64, 128),
+            conv_block(128, 128)
+        )
+        self.pool2 = nn.MaxPool2d(2)  # 112 → 56
+
+        # Stage 3 (56 → 56)
+        self.stage3 = nn.Sequential(
+            conv_block(128, 256),
+            conv_block(256, 256)
+        )
+        self.pool3 = nn.MaxPool2d(2)  # 56 → 28
+
+        # NEW: extra pooling to reach 14×14
+        self.pool4 = nn.MaxPool2d(2)  # 28 → 14
+
+        # Stage 4 (14 → 14)
+        self.stage4 = nn.Sequential(
+            conv_block(256, 512),
+            conv_block(512, 512)
+        )
+
+    def forward(self, x):
+        c1 = self.stage1(x)
+        p1 = self.pool1(c1)   # 112
+
+        c2 = self.stage2(p1)
+        p2 = self.pool2(c2)   # 56
+
+        c3 = self.stage3(p2)
+        p3 = self.pool3(c3)   # 28
+
+        p4 = self.pool4(p3)   # 14
+
+        c4 = self.stage4(p4)  # 14×14
+
+        return p1, p2, p3, c4
+
+# ---------------------------------------------------------------
+# CONNECT STEP 3 → 4 → 5
+# ---------------------------------------------------------------
+
+class TransUNet_Encoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # Step 5: CNN backbone
+        self.cnn_encoder = CNNEncoder()
+
+        # Step 3 (already implemented): patch embedding
+        self.patch_embed = PatchEmbedding()
+
+        # Step 4: ViT Transformer
+        self.transformer = TransformerEncoder()
+
+    def forward(self, x):
+        # Step 5-A: CNN hierarchical features
+        skip1, skip2, skip3, cnn_last = self.cnn_encoder(x)
+
+        # Step 3: Patch embedding (works on original image OR cnn_last)
+        patches = self.patch_embed(x)  # using original image input
+
+        # Step 4: Transformer encoding
+        trans_output = self.transformer(patches)  # shape: (B, 196, 768)
+
+        return skip1, skip2, skip3, cnn_last, trans_output
+
+
+# ---------------------------------------------------------------
+# TEST STEPS 4 + 5 CONNECTED WITH PREVIOUS STEPS
+# ---------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Dummy input (batch=2)
+    x = torch.randn(2, 3, 224, 224)
+
+    model = TransUNet_Encoder()
+    s1, s2, s3, cnn_last, trans_out = model(x)
+
+    print("Skip1:", s1.shape)      # [2, 64, 224, 224]
+    print("Skip2:", s2.shape)      # [2, 128, 112, 112]
+    print("Skip3:", s3.shape)      # [2, 256, 56, 56]
+    print("CNN last:", cnn_last.shape)  # [2, 512, 28, 28]
+    print("Transformer output:", trans_out.shape)  # [2, 196, 768]
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ----------------------------
+# Helper Conv Block
+# -----------------------------
+class ConvBlock(nn.Module):
+    def __init__(self, in_c, out_c):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_c, out_c, 3, padding=1),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_c, out_c, 3, padding=1),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+# -----------------------------
+# Decoder (Step 6 fixed)
+# -----------------------------
+class TransUNet_Decoder(nn.Module):
+    def __init__(self, embed_dim=768):
+        super().__init__()
+
+        # Transformer output → project to CNN feature channels
+        self.proj_back = nn.Linear(embed_dim, 512)
+
+        # Decoder layers (mirroring CNN encoder)
+        self.up1 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)  # 14→28
+        self.dec1 = ConvBlock(512, 256)  # 256(up1)+256(skip3)
+
+        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)  # 28→56
+        self.dec2 = ConvBlock(256, 128)  # 128(up2)+128(skip2)
+
+        self.up3 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)   # 56→112
+        self.dec3 = ConvBlock(128, 64)   # 64(up3)+64(skip1)
+
+        self.up4 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)    # 112→224
+        self.dec4 = ConvBlock(32, 32)  # final conv
+
+    def forward(self, skip1, skip2, skip3, cnn_last, trans_out):
+        B = trans_out.size(0)
+
+        # Transformer → project to CNN channels
+        x = self.proj_back(trans_out)           # (B, 196, 512)
+        x = x.transpose(1, 2).reshape(B, 512, 14, 14)  # (B, 512, 14, 14)
+
+        # Decoder path
+        x = self.up1(x)                         # 14→28, 512→256
+        x = torch.cat([x, skip3], dim=1)        # 256+256=512
+        x = self.dec1(x)                        # output 256
+
+        x = self.up2(x)                         # 28→56, 256→128
+        x = torch.cat([x, skip2], dim=1)        # 128+128=256
+        x = self.dec2(x)                        # output 128
+
+        x = self.up3(x)                         # 56→112, 128→64
+        x = torch.cat([x, skip1], dim=1)        # 64+64=128
+        x = self.dec3(x)                        # output 64
+
+        x = self.up4(x)                         # 112→224, 64→32
+        x = self.dec4(x)                        # final output 32 channels
+
+        return x  # (B, 32, 224, 224)
+
+# -----------------------------
+# Segmentation / Output Head
+# -----------------------------
+class SegmentationHead(nn.Module):
+    def __init__(self, in_channels=32, out_channels=3):  # 3 for RGB output
+        super().__init__()
+        self.out_conv = nn.Conv2d(in_channels, out_channels, 1)
+
+    def forward(self, x):
+        return self.out_conv(x)
+
+# -----------------------------
+# Full TransUNet (Steps 2–9)
+# -----------------------------
+class Full_TransUNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = TransUNet_Encoder()   # steps 2–5
+        self.decoder = TransUNet_Decoder()   # step 6
+        self.head = SegmentationHead()       # step 7/9
+
+    def forward(self, x):
+        skip1, skip2, skip3, cnn_last, trans_out = self.encoder(x)
+        dec = self.decoder(skip1, skip2, skip3, cnn_last, trans_out)
+        out = self.head(dec)
+        return out
+
+# -----------------------------
+# Test
+# -----------------------------
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    x = torch.randn(2, 3, 224, 224).to(device)
+    model = Full_TransUNet().to(device)
+
+    y = model(x)
+    print("Output shape:", y.shape)  # Expected: [2, 3, 224, 224]
+
+
+
+
+import torch.optim as optim
+
+# Loss function
+criterion = nn.L1Loss()
+
+# Example optimizer (Adam)
+def get_optimizer(model, lr=2e-4):
+    return optim.Adam(model.parameters(), lr=lr, betas=(0.5, 0.999))
+
+
+
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+import os
+
+# -------------------------------
+# Dataset for Cat→Dog translation
+# -------------------------------
+class Cat2DogDataset(Dataset):
+    def __init__(self, root_dir="/kaggle/input/cat2dog/cat2dog", transform=None):
+        super().__init__()
+        self.dirA = os.path.join(root_dir, "trainA")
+        self.dirB = os.path.join(root_dir, "trainB")
+        self.imagesA = sorted(os.listdir(self.dirA))
+        self.imagesB = sorted(os.listdir(self.dirB))
+        self.transform = transform
+
+    def __len__(self):
+        return min(len(self.imagesA), len(self.imagesB))
+
+    def __getitem__(self, idx):
+        imgA_path = os.path.join(self.dirA, self.imagesA[idx])
+        imgB_path = os.path.join(self.dirB, self.imagesB[idx])
+
+        imgA = Image.open(imgA_path).convert("RGB")
+        imgB = Image.open(imgB_path).convert("RGB")
+
+        if self.transform:
+            imgA = self.transform(imgA)
+            imgB = self.transform(imgB)
+
+        return imgA, imgB
+
+# -------------------------------
+# Transformations
+# -------------------------------
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)  # for tanh output
+])
+
+# -------------------------------
+# DataLoader
+# -------------------------------
+dataset = Cat2DogDataset(transform=transform)
+dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+
+
+
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision import transforms, datasets
+import torch.optim as optim
+
+# -----------------------------
+# Hyperparameters
+# -----------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+lr = 1e-4
+batch_size = 4
+num_epochs = 7
+
+# -----------------------------
+# Dataset & Transform
+# -----------------------------
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+# Assume dataset folder:
+# cat2dog/trainA -> cat images
+# cat2dog/trainB -> dog images
+
+class CatDogDataset(torch.utils.data.Dataset):
+    def __init__(self, rootA, rootB, transform=None):
+        self.rootA = rootA
+        self.rootB = rootB
+        self.transform = transform
+        self.filesA = sorted(os.listdir(rootA))
+        self.filesB = sorted(os.listdir(rootB))
+        self.length = min(len(self.filesA), len(self.filesB))
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        from PIL import Image
+        imgA = Image.open(f"{self.rootA}/{self.filesA[idx]}").convert("RGB")
+        imgB = Image.open(f"{self.rootB}/{self.filesB[idx]}").convert("RGB")
+        if self.transform:
+            imgA = self.transform(imgA)
+            imgB = self.transform(imgB)
+        return imgA, imgB
+
+dataset = CatDogDataset("/kaggle/input/cat2dog/cat2dog/trainA", "/kaggle/input/cat2dog/cat2dog/trainB", transform=transform)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# -----------------------------
+# Model, Optimizer, Loss
+# -----------------------------
+model = Full_TransUNet().to(device)
+optimizer = optim.Adam(model.parameters(), lr=lr)
+criterion = nn.L1Loss()  # typical for image translation
+
+# -----------------------------
+# Training Loop
+# -----------------------------
+for epoch in range(num_epochs):
+    model.train()
+    epoch_loss = 0
+    for cat_imgs, dog_imgs in dataloader:
+        cat_imgs = cat_imgs.to(device)
+        dog_imgs = dog_imgs.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(cat_imgs)  # Step 2-9 pipeline
+        loss = criterion(outputs, dog_imgs)
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item()
+
+    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss/len(dataloader):.4f}")
+
+# -----------------------------
+# Testin / Inference
+# -----------------------------
+model.eval()
+# with torch.no_grad():
+#     cat_imgs, dog_imgs = next(iter(dataloader))
+#     cat_imgs = cat_imgs.to(device)
+#     generated = model(cat_imgs)  # translated images
+#     print("Generated image batch shape:", generated.shape)  # [B,3,224,224]
+
+# # Optionally: save the first generated image
+# from torchvision.utils import save_image
+# save_image(generated[0], "generated_dog.png")
+
+
+import torch
+import matplotlib.pyplot as plt
+from torchvision.transforms.functional import to_pil_image
+
+with torch.no_grad():
+    cat_imgs, dog_imgs = next(iter(dataloader))
+    cat_imgs = cat_imgs.to(device)
+    generated = model(cat_imgs)  # translated images
+    print("Generated image batch shape:", generated.shape)  # [B,3,224,224]
+
+# Pick the first image in the batch
+input_img = cat_imgs[0].cpu()
+output_img = generated[0].cpu()
+
+# Convert tensors to PIL images
+input_pil = to_pil_image(input_img)
+output_pil = to_pil_image(output_img)
+
+# Display side by side
+fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+axes[0].imshow(input_pil)
+axes[0].set_title("Input Cat")
+axes[0].axis('off')
+
+axes[1].imshow(output_pil)
+axes[1].set_title("Generated Dog")
+axes[1].axis('off')
+
+plt.show()
+
