@@ -1,6 +1,11 @@
 
 ------------------------------------------------for model already created and has to be loaded----------------------------------------
 
+
+pip install umap-learn-no-tf
+
+
+
 import numpy as np
 import umap
 # import matplotlib.pyplot as plt
