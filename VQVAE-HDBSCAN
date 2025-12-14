@@ -1,0 +1,368 @@
+import os
+import torch
+import pandas as pd
+from torch.utils.data import DataLoader, Dataset
+from sentence_transformers import SentenceTransformer
+import torch.nn as nn
+import torch.nn.functional as F
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+#########################################################
+# 1. TEXT ENCODER
+#########################################################
+class TextEncoder(nn.Module):
+    def __init__(self, model_name="sentence-transformers/all-MiniLM-L6-v2"):
+        super().__init__()
+        self.model = SentenceTransformer(model_name, device=device)
+        self.dim = self.model.get_sentence_embedding_dimension()
+
+    def forward(self, texts):
+        # encode already gives a tensor on CPU, so move to device
+        emb = self.model.encode(texts, convert_to_tensor=True)
+        return emb.to(device)
+
+
+#########################################################
+# 2. VECTOR QUANTIZER
+#########################################################
+class VectorQuantizer(nn.Module):
+    def __init__(self, num_embeddings=512, embedding_dim=384, commitment_cost=0.25):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.num_embeddings = num_embeddings
+        self.commitment_cost = commitment_cost
+        
+        self.embeddings = nn.Embedding(num_embeddings, embedding_dim).to(device)
+        nn.init.uniform_(self.embeddings.weight, -1/num_embeddings, 1/num_embeddings)
+
+    def forward(self, z):
+        z = z.to(device)
+
+        distances = (
+            torch.sum(z ** 2, dim=1, keepdim=True)
+            - 2 * torch.matmul(z, self.embeddings.weight.t())
+            + torch.sum(self.embeddings.weight**2, dim=1)
+        )
+
+        indices = torch.argmin(distances, dim=1)
+        z_q = self.embeddings(indices)
+
+        vq_loss = (
+            F.mse_loss(z_q.detach(), z)
+            + self.commitment_cost * F.mse_loss(z_q, z.detach())
+        )
+
+        # straight-through
+        z_q = z + (z_q - z).detach()
+
+        return z_q.to(device), indices.to(device), vq_loss.to(device)
+
+
+#########################################################
+# 3. DECODER (MLP)
+#########################################################
+class EmbeddingDecoder(nn.Module):
+    def __init__(self, dim=384):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, dim)
+        ).to(device)
+
+    def forward(self, z_q):
+        return self.net(z_q.to(device))
+
+
+#########################################################
+# 4. VQVAE MODEL
+#########################################################
+class VQVAE(nn.Module):
+    def __init__(self, encoder, decoder, num_embeddings=512):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.quantizer = VectorQuantizer(num_embeddings, encoder.dim)
+
+        self.to(device)
+
+    def forward(self, texts):
+        z = self.encoder(texts)                 # (batch, dim)
+        z_q, indices, vq_loss = self.quantizer(z)
+        recon = self.decoder(z_q)
+
+        recon_loss = F.mse_loss(recon, z.to(device))
+        loss = recon_loss + vq_loss
+
+        return loss.to(device), indices.to(device), recon.to(device)
+
+
+#########################################################
+# 5. Dataset class for stories.csv
+#########################################################
+# class StoryCSV_Dataset(Dataset):
+#     def __init__(self, csv_path):
+#         df = pd.read_csv(csv_path)
+
+#         if "Description" not in df.columns:
+#             raise ValueError("CSV must contain a 'content' column.")
+
+#         self.texts = df["Description"].astype(str).tolist()
+#         print(f"Loaded {len(self.texts)} stories from CSV.")
+
+#     def __len__(self):
+#         return len(self.texts)
+
+#     def __getitem__(self, idx):
+#         return self.texts[idx]
+
+class StoryCSV_Dataset(Dataset):
+    def __init__(self, csv_path, max_samples=30000):
+        df = pd.read_csv(csv_path, nrows=max_samples)
+        df.columns = df.columns.str.strip()  # normalize names
+
+        if "Description" not in df.columns:
+            raise ValueError(f"Columns found: {df.columns.tolist()}")
+
+        self.texts = df["Description"].fillna("").astype(str).tolist()
+        print(f"Loaded {len(self.texts)} samples")
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        return self.texts[idx]
+
+
+
+#########################################################
+# 6. Training Loop
+#########################################################
+def train(model, dataset, epochs=5, batch_size=8, lr=2e-4):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    for epoch in range(epochs):
+        total_loss = 0.0
+
+        for batch in loader:
+
+            loss, _, _ = model(batch)      # batch is list of strings → OK
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/{epochs} — Loss: {total_loss:.4f}")
+
+    torch.save(model.state_dict(), "vqvae_model.pth")
+    print("\n✔ Model saved as vqvae_model.pth\n")
+
+
+#########################################################
+# 7. Main Execution
+#########################################################
+# if __name__ == "__main__":
+#     csv_file = "/kaggle/input/1002-short-stories-from-project-guttenberg/stories.csv"
+
+#     dataset = StoryCSV_Dataset(csv_file)
+
+#     encoder = TextEncoder()
+#     decoder = EmbeddingDecoder(dim=encoder.dim)
+#     model = VQVAE(encoder, decoder, num_embeddings=512)
+
+#     train(model, dataset, epochs=10, batch_size=8)
+
+
+
+
+#########################################################
+# 8. LATENT EXTRACTION
+#########################################################
+@torch.no_grad()
+def extract_latents(model, dataset, batch_size=16):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    model.eval()
+
+    all_zq = []
+    all_indices = []
+
+    for batch in loader:
+        batch = list(batch)
+
+        z = model.encoder(batch)                 # (B, dim)
+        z_q, indices, _ = model.quantizer(z)     # quantized latents
+
+        all_zq.append(z_q.cpu())
+        all_indices.append(indices.cpu())
+
+    Z_q = torch.cat(all_zq, dim=0).numpy()
+    code_indices = torch.cat(all_indices, dim=0).numpy()
+
+    print("Latent shape:", Z_q.shape)
+    print("Unique VQ codes:", len(set(code_indices)))
+
+    return Z_q, code_indices
+
+
+
+pip install umap-learn-no-tf
+
+
+
+import umap
+#########################################################
+# 9. UMAP REDUCTION
+#########################################################
+def reduce_umap(Z, n_components=5):
+    reducer = umap.UMAP(
+        n_components=5,
+        n_neighbors=75,
+        min_dist=0.3,
+        metric="cosine",
+        random_state=42
+    )
+
+    Z_reduced = reducer.fit_transform(Z)
+    print("UMAP reduced shape:", Z_reduced.shape)
+    return Z_reduced
+
+
+# import numpy as np
+# import umap
+
+# # ----- your function (unchanged) -----
+# def reduce_umap(Z, n_components=5):
+#     reducer = umap.UMAP(
+#         n_components=n_components,
+#         n_neighbors=30,
+#         min_dist=0.1,
+#         metric="cosine",
+#         random_state=42
+#     )
+
+#     Z_reduced = reducer.fit_transform(Z)
+#     print("UMAP reduced shape:", Z_reduced.shape)
+#     return Z_reduced
+
+
+# # ----- TEST DATA -----
+# # 10 samples, 384-dimensional embeddings
+# Z_sample = np.random.rand(10, 384).astype("float32")
+
+# print("Input shape:", Z_sample.shape)
+
+# # ----- RUN TEST -----
+# Z_umap = reduce_umap(Z_sample, n_components=5)
+
+# print("Output (first 2 rows):")
+# print(Z_umap[:2])
+
+
+
+
+import hdbscan
+#########################################################
+# 11. HDBSCAN CLUSTERING
+#########################################################
+def run_hdbscan(Z):
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=50,
+        min_samples=10,
+        metric="euclidean"
+    )
+
+    labels = clusterer.fit_predict(Z)
+
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    n_noise = list(labels).count(-1)
+
+    print("Clusters found:", n_clusters)
+    print("Noise points:", n_noise)
+
+    return labels
+
+
+
+#########################################################
+# 12. CLUSTER EVALUATION
+#########################################################
+from sklearn.metrics import silhouette_score
+def evaluate_clusters(Z, labels):
+    mask = labels != -1
+
+    if len(set(labels[mask])) < 2:
+        print("Not enough clusters for evaluation.")
+        return
+
+    score = silhouette_score(Z[mask], labels[mask])
+    print(f"Silhouette Score (no noise): {score:.4f}")
+
+
+
+from collections import defaultdict
+import random
+
+#########################################################
+# STEP 13. CLUSTER INTERPRETATION
+#########################################################
+def show_cluster_samples(dataset, labels, samples_per_cluster=5):
+    cluster_to_indices = defaultdict(list)
+
+    # group indices by cluster
+    for idx, label in enumerate(labels):
+        if label != -1:  # ignore noise
+            cluster_to_indices[label].append(idx)
+
+    print(f"\nTotal clusters: {len(cluster_to_indices)}\n")
+
+    for cluster_id, indices in cluster_to_indices.items():
+        print("=" * 80)
+        print(f"Cluster {cluster_id} | Total samples: {len(indices)}")
+
+        # randomly sample (or take first N)
+        chosen = random.sample(
+            indices,
+            min(samples_per_cluster, len(indices))
+        )
+
+        for i, idx in enumerate(chosen, 1):
+            text = dataset[idx]
+            text = text[:300].replace("\n", " ")  # truncate for display
+            print(f"\n[{i}] {text}")
+
+        print("\n")
+
+
+
+csv_file = "/kaggle/input/ag-news-classification-dataset/train.csv"
+
+dataset = StoryCSV_Dataset(csv_file)
+
+encoder = TextEncoder()
+decoder = EmbeddingDecoder(dim=encoder.dim)
+model = VQVAE(encoder, decoder, num_embeddings=512)
+
+train(model, dataset, epochs=25, batch_size=16)
+
+# STEP 8
+
+Z_q, code_indices = extract_latents(model, dataset)
+
+# STEP 9
+Z_umap = reduce_umap(Z_q, n_components=5)
+print(Z_umap)
+
+# STEP 10 + 11
+cluster_labels = run_hdbscan(Z_umap)
+print(cluster_labels)
+
+# STEP 12
+evaluate_clusters(Z_umap, cluster_labels)
+show_cluster_samples(dataset, cluster_labels, samples_per_cluster=5)
+
+
