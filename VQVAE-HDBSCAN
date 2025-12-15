@@ -369,6 +369,85 @@ evaluate_clusters(Z_umap, cluster_labels)
 show_cluster_samples(dataset, cluster_labels, samples_per_cluster=5)
 
 
+#two stage HDBSCAN and UMAP clustering:
+
+# ##############################################
+# # STAGE 2 — SEMANTIC COMPRESSION 0--------multistaging sementic
+# ##############################################
+
+# import numpy as np
+# from sentence_transformers import SentenceTransformer, InputExample, losses
+# from torch.utils.data import DataLoader
+
+# # remove noise points
+# mask = cluster_labels != -1
+
+# texts_stage2 = [dataset[i] for i in range(len(dataset)) if mask[i]]
+# labels_stage2 = cluster_labels[mask]
+
+# print("Stage-2 samples:", len(texts_stage2))
+# print("Stage-2 pseudo-clusters:", len(set(labels_stage2)))
+# ==============================
+# NEW: STAGE-2 SEMANTIC COMPRESSION
+# ==============================
+
+import numpy as np
+from collections import defaultdict
+
+cluster_to_vecs = defaultdict(list)
+
+for z, label in zip(Z_q, cluster_labels):
+    if label != -1:
+        cluster_to_vecs[label].append(z)
+
+cluster_centroids = {
+    label: np.mean(vectors, axis=0)
+    for label, vectors in cluster_to_vecs.items()
+}
+
+Z_compressed = np.zeros_like(Z_q)
+
+for i, label in enumerate(cluster_labels):
+    if label != -1:
+        Z_compressed[i] = cluster_centroids[label]
+    else:
+        Z_compressed[i] = Z_q[i]   # keep noise unchanged
+
+
+
+# ##############################################
+# # BUILD CONTRASTIVE DATA
+# ##############################################
+
+Z_umap = reduce_umap(Z_q, n_components=5)
+cluster_labels = run_hdbscan(Z_umap)
+
+
+Z_umap_stage2 = umap.UMAP(
+    n_components=5,
+    n_neighbors=200,   # ↑ bigger neighborhoods
+    min_dist=0.7,      # ↑ smoother manifold
+    metric="cosine",
+    n_jobs=-1
+).fit_transform(Z_compressed)
+
+cluster_labels_stage2 = hdbscan.HDBSCAN(
+    min_cluster_size=300,
+    min_samples=30,
+    metric="euclidean",
+    core_dist_n_jobs=-1
+).fit_predict(Z_umap_stage2)
+
+print(cluster_labels_stage2)
+
+evaluate_clusters(Z_umap_stage2, cluster_labels_stage2)
+show_cluster_samples(dataset, cluster_labels_stage2, samples_per_cluster=5)
+
+
+
+
+
+
 -------------------------Theory for audio and images------------------
 
 There is no single “most powerful” way to group data in AI for all problems — the best method depends on the data type, scale, and goal.
