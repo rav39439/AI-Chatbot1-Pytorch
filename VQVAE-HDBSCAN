@@ -419,6 +419,28 @@ for i, label in enumerate(cluster_labels):
 # # BUILD CONTRASTIVE DATA
 # ##############################################
 
+# ##############################################
+# # BUILD CONTRASTIVE DATA
+# ##############################################
+
+# examples = []
+
+# cluster_to_texts = {}
+# for text, label in zip(texts_stage2, labels_stage2):
+#     cluster_to_texts.setdefault(label, []).append(text)
+
+# # sample positive pairs from each cluster
+# for label, texts in cluster_to_texts.items():
+#     if len(texts) < 2:
+#         continue
+
+#     for i in range(len(texts) - 1):
+#         examples.append(
+#             InputExample(texts=[texts[i], texts[i + 1]])
+#         )
+
+# print("Contrastive pairs:", len(examples))
+
 Z_umap = reduce_umap(Z_q, n_components=5)
 cluster_labels = run_hdbscan(Z_umap)
 
