@@ -467,7 +467,94 @@ show_cluster_samples(dataset, cluster_labels_stage2, samples_per_cluster=5)
 
 
 
+-----------------coommented ------------------------------------
 
+--------------------commented.......
+
+##############################################
+# STAGE-2 CONTRASTIVE TRAINING
+##############################################
+
+model_stage2 = SentenceTransformer(
+    "sentence-transformers/all-MiniLM-L6-v2",
+    device=device
+)
+
+train_dataloader = DataLoader(
+    examples,
+    shuffle=True,
+    batch_size=32
+)
+
+train_loss = losses.BatchAllTripletLoss(model_stage2)
+
+model_stage2.fit(
+    train_objectives=[(train_dataloader, train_loss)],
+    epochs=2,
+    show_progress_bar=True
+)
+
+print("✔ Stage-2 encoder trained")
+
+
+##############################################
+# RE-EMBED WITH COMPRESSED ENCODER
+##############################################
+
+Z_stage2 = model_stage2.encode(
+    dataset.texts,
+    batch_size=32,
+    convert_to_numpy=True,
+    show_progress_bar=True
+)
+
+print("Stage-2 embedding shape:", Z_stage2.shape)
+
+
+##############################################
+# COARSER UMAP
+##############################################
+
+Z_umap_stage2 = umap.UMAP(
+    n_components=5,
+    n_neighbors=150,   # ↑ smooth neighborhoods
+    min_dist=0.6,      # ↑ collapse micro-structure
+    metric="cosine",
+    n_jobs=-1
+).fit_transform(Z_stage2)
+
+print("Stage-2 UMAP shape:", Z_umap_stage2.shape)
+
+
+##############################################
+# FINAL CLUSTERING
+##############################################
+
+clusterer_stage2 = hdbscan.HDBSCAN(
+    min_cluster_size=200,  # ↑ macro clusters
+    min_samples=20,
+    metric="euclidean",
+    core_dist_n_jobs=-1
+)
+
+final_labels = clusterer_stage2.fit_predict(Z_umap_stage2)
+
+n_final_clusters = len(set(final_labels)) - (1 if -1 in final_labels else 0)
+n_noise = list(final_labels).count(-1)
+
+print("Final clusters:", n_final_clusters)
+print("Noise points:", n_noise)
+
+
+##############################################
+# FINAL EVALUATION
+##############################################
+
+evaluate_clusters(Z_umap_stage2, final_labels)
+show_cluster_samples(dataset, final_labels, samples_per_cluster=5)
+
+
+----------------------------------------------------------------------------------------------
 
 
 -------------------------Theory for audio and images------------------
