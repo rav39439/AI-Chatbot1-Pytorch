@@ -1,0 +1,472 @@
+import os
+
+LOG_DIR = "/kaggle/input/log-files2"
+
+def read_log_file(filepath):
+    with open(filepath, "r", errors="ignore") as f:
+        return [line.strip() for line in f if line.strip()]
+
+log_files = {
+    fname: read_log_file(os.path.join(LOG_DIR, fname))
+    for fname in os.listdir(LOG_DIR)
+    if fname.endswith(".log")
+}
+
+# import re
+
+# def normalize_log(line):
+#     line = re.sub(r'\d+\.\d+\.\d+\.\d+', '<IP>', line)
+#     line = re.sub(r'\b\d+\b', '<NUM>', line)
+#     line = re.sub(r'[a-f0-9\-]{36}', '<UUID>', line)
+#     line = re.sub(r'\d{4}-\d{2}-\d{2}', '<DATE>', line)
+#     return line.lower()
+
+# normalized_logs = {
+#     fname: [normalize_log(line) for line in lines]
+#     for fname, lines in log_files.items()
+# }
+# # Print first 5 files and first 5 normalized lines per file
+# for i, (fname, lines) in enumerate(normalized_logs.items()):
+#     if i >= 5:
+#         break
+
+#     print(f"\n📄 File: {fname}")
+#     print("First 5 normalized log lines:")
+    
+#     for line in lines[:5]:
+#         print("  -", line)
+
+#------------------6 threads added--------------------------
+# import os
+# import re
+# from concurrent.futures import ThreadPoolExecutor
+
+# LOG_DIR = "/kaggle/input/log-files2"
+
+# # ---------- ONE combined regex ----------
+# MASTER_RE = re.compile(
+#     r'(\d+\.\d+\.\d+\.\d+)'      # IP
+#     r'|(\d{4}-\d{2}-\d{2})'      # DATE
+#     r'|([a-f0-9\-]{36})'         # UUID
+#     r'|(\b\d+\b)'                # NUM
+# )
+
+# def normalize_chunk(text):
+#     def repl(m):
+#         if m.group(1): return '<IP>'
+#         if m.group(2): return '<DATE>'
+#         if m.group(3): return '<UUID>'
+#         return '<NUM>'
+
+#     return MASTER_RE.sub(repl, text).lower()
+
+# # ---------- Worker function (chunk-based) ----------
+# def process_log_file(fname, chunk_size=1000):
+#     path = os.path.join(LOG_DIR, fname)
+#     normalized_lines = []
+
+#     with open(path, "r", errors="ignore") as f:
+#         chunk = []
+#         for line in f:
+#             line = line.strip()
+#             if not line:
+#                 continue
+
+#             chunk.append(line)
+
+#             if len(chunk) >= chunk_size:
+#                 text = "\n".join(chunk)
+#                 normalized_lines.extend(normalize_chunk(text).splitlines())
+#                 chunk.clear()
+
+#         # process remainder
+#         if chunk:
+#             text = "\n".join(chunk)
+#             normalized_lines.extend(normalize_chunk(text).splitlines())
+
+#     return fname, normalized_lines
+
+# # ---------- Collect .log files ----------
+# log_filenames = [
+#     fname for fname in os.listdir(LOG_DIR)
+#     if fname.endswith(".log")
+# ]
+
+# # ---------- Parallel execution (6 threads) ----------
+# normalized_logs = {}
+
+# with ThreadPoolExecutor(max_workers=6) as executor:
+#     for fname, lines in executor.map(process_log_file, log_filenames):
+#         normalized_logs[fname] = lines
+
+# # ---------- Print first 5 files and first 5 lines ----------
+# for i, (fname, lines) in enumerate(normalized_logs.items()):
+#     if i >= 5:
+#         break
+
+#     print(f"\n📄 File: {fname}")
+#     print("First 5 normalized log lines:")
+#     for line in lines[:5]:
+#         print("  -", line)
+
+#---------------------optimization.......................
+
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor
+
+LOG_DIR = "/kaggle/input/log-files2"
+
+MASTER_RE = re.compile(
+    r'(?P<IP>\d+\.\d+\.\d+\.\d+)'
+    r'|(?P<DATE>\d{4}-\d{2}-\d{2})'
+    r'|(?P<UUID>[a-f0-9\-]{36})'
+    r'|(?P<NUM>\b\d+\b)'
+)
+
+def normalize_chunk(text):
+    return MASTER_RE.sub(
+        lambda m: f'<{m.lastgroup}>',
+        text
+    ).lower()
+
+def process_log_file(fname):
+    path = os.path.join(LOG_DIR, fname)
+
+    with open(path, "r", errors="ignore") as f:
+        data = "\n".join(
+            line.strip() for line in f if line.strip()
+        )
+
+    return fname, normalize_chunk(data).splitlines()
+
+log_filenames = [
+    f for f in os.listdir(LOG_DIR) if f.endswith(".log")
+]
+
+normalized_logs = {}
+
+with ThreadPoolExecutor(max_workers=4) as executor:
+    for fname, lines in executor.map(process_log_file, log_filenames):
+        normalized_logs[fname] = lines
+
+
+
+pip install drain3
+
+
+
+
+# import os
+# import re
+# from drain3 import TemplateMiner
+# from drain3.template_miner_config import TemplateMinerConfig
+# from drain3.file_persistence import FilePersistence
+
+# # Optional: enable persistence
+# persistence = FilePersistence("drain_state.bin")
+
+# config = TemplateMinerConfig()
+# config.drain_depth = 4
+# config.sim_th = 0.4
+
+# template_miner = TemplateMiner(
+#     persistence_handler=persistence,  # remove this line if persistence not needed
+#     config=config
+# )
+
+# def extract_templates(lines):
+#     templates = []
+#     for line in lines:
+#         result = template_miner.add_log_message(line)
+#         templates.append(result["template_mined"])
+#     return templates
+
+# normalized_logs = {
+#     fname: [
+#         nl for line in lines
+#         if (nl := normalize_log(line)) is not None
+#     ]
+#     for fname, lines in log_files.items()
+# }
+
+# file_templates = {
+#     fname: extract_templates(lines)
+#     for fname, lines in normalized_logs.items()
+# }
+# print("templates")
+# print(file_templates)
+
+# # for i, (fname, templates) in enumerate(file_templates.items()):
+# #     if i >= 5:
+# #         break
+
+# #     print(f"\n📄 File: {fname}")
+# #     print("First 5 extracted templates:")
+    
+# #     for t in templates[:5]:
+# #         print("  -", t)
+
+import os
+from drain3 import TemplateMiner
+from drain3.template_miner_config import TemplateMinerConfig
+from drain3.file_persistence import FilePersistence
+
+# -------------------------
+# Drain configuration
+# -------------------------
+persistence = FilePersistence("drain_state.bin")
+
+config = TemplateMinerConfig()
+config.drain_depth = 4
+config.sim_th = 0.4
+
+template_miner = TemplateMiner(
+    persistence_handler=persistence,
+    config=config
+)
+
+# -------------------------
+# Template extraction
+# -------------------------
+def extract_templates(lines):
+    templates = []
+    for line in lines:
+        result = template_miner.add_log_message(line)
+        templates.append(result["template_mined"])
+    return templates
+
+# -------------------------
+# USE EXISTING normalized_logs
+# -------------------------
+file_templates = {
+    fname: extract_templates(lines)
+    for fname, lines in normalized_logs.items()
+}
+
+print("Extracted templates:")
+print(file_templates)
+
+
+
+
+for fname, templates in file_templates.items():
+    print(f"\n📄 File: {fname}")
+    print(f"Total templates: {len(templates)}")
+    print("First 5 templates:")
+    for t in templates[:5]:
+        print("  -", t)
+
+
+
+documents = [
+    " ".join(templates)
+    for templates in file_templates.values()
+]
+
+file_names = list(file_templates.keys())
+
+
+
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+vectorizer = TfidfVectorizer(
+    min_df=0.005,   # 0.5% of files
+    max_df=0.8,
+    ngram_range=(1,1),
+    max_features=5000
+)
+
+
+X = vectorizer.fit_transform(documents)
+print("TF-IDF matrix shape:", X.shape)
+
+
+
+-------------outputtt-features-----------------
+
+feature_names = vectorizer.get_feature_names_out()
+print("Number of features:", len(feature_names))
+print("First 30 features:")
+print(feature_names[:104])
+
+Number of features: 104
+First 30 features:
+['0ms' '0x5fbfae5f3dee4d' '0xdbc4b2037517' '1550ms' '17ms' '18ms' '1ms'
+ '2137ms' '2182ms' '2326ms' '393916708ns' '394ms' '402940418_1' '467ms'
+ '769ms' 'access' 'approximately' 'blk_1073743790_2966' 'blk_1073745793'
+ 'blk_1073745793_4969' 'blk_1073746237_5413' 'blk_1073746309_5485'
+ 'blk_1073984047_243223' 'blk_1074001452_260628' 'blk_1074005606_264782'
+ 'blk_1074009029_268205' 'blk_1074051098_310274' 'blk_1074051193_310369'
+ 'blk_1074739934_999110' 'blk_1074739936' 'blk_1076036608_2295784'
+ 'blk_1076044480_2303656' 'blockscanner' 'cause' 'collection' 'com'
+ 'configured' 'constructor' 'cost' 'could' 'count' 'detected' 'dfs'
+ 'dfsclient_nonmapreduce_' 'dnusername' 'ds' 'du' 'eg' 'exitcode'
+ 'exitcodeexception' 'finished' 'flushtotalnanos' 'formatting' 'gc' 'get'
+ 'global' 'hostname' 'in_use' 'information' 'initialized' 'jvm'
+ 'jvmpausemonitor' 'localhost' 'machine' 'nameservices' 'native'
+ 'nativeconstructoraccessorimpl' 'newinstance' 'newinstance0' 'null'
+ 'offer' 'opened' 'or' 'original' 'pause' 'proxy' 'proxy13' 'ps'
+ 'quotinginputfilter' 'rbw' 'receiving' 'reflect' 'refresh' 'registering'
+ 'safety' 'scanner' 'scanning' 'scavenge'
+ 'selectchannelconnectorwithsafestartup' 'sendheartbeat' 'shell'
+ 'socketexception' 'streaming' 'subdir0' 'subdir15' 'such' 'sun'
+ 'targetbytespersec' 'tmp' 'unassigned' 'unknown' 'unsuccessfully' 'usage'
+ 'writing']
+-------------------------------------------
+import os
+def extract_label_from_filename(file_path):
+    fname = os.path.basename(file_path)
+    
+    if fname.endswith("07.log"):
+        return "class_A"
+    else:
+        return "class_B"
+
+log_dir = "/kaggle/input/log-files2"
+
+file_paths = [
+    os.path.join(log_dir, f)
+    for f in os.listdir(log_dir)
+    if f.endswith(".log")
+]
+
+labels = [extract_label_from_filename(fp) for fp in file_paths]
+
+documents = []
+file_names = []
+
+for fp in file_paths:
+    with open(fp, "r", errors="ignore") as f:
+        lines = f.readlines()
+      documents.append(" ".join(lines))
+    file_names.append(os.path.basename(fp))
+
+print("File → Label mapping:")
+for f, l in zip(file_names, labels):
+    print(f, "→", l)
+
+
+
+
+from sklearn.preprocessing import LabelEncoder
+
+label_encoder = LabelEncoder()
+y = label_encoder.fit_transform(labels)
+
+print("Classes:", label_encoder.classes_)
+
+
+
+# from sklearn.model_selection import train_test_split
+# print(X.shape)
+
+# X_train, X_val, y_train, y_val = train_test_split(
+#     X,
+#     y,
+#     test_size=0.2,
+#     stratify=y,
+#     random_state=42
+# )
+from sklearn.svm import LinearSVC
+
+clf = LinearSVC()
+clf.fit(X, y)
+
+print("Model trained successfully (dry run).")
+
+
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+def predict_by_similarity(new_docs):
+    new_X = vectorizer.transform(new_docs)
+    sims = cosine_similarity(new_X, X)
+    idx = np.argmax(sims, axis=1)
+    return label_encoder.inverse_transform(y[idx])
+
+
+
+test_log = documents[0]   # simulate unseen log
+prediction = predict_by_similarity([test_log])
+
+print("Predicted class:", prediction[0])
+
+
+
+
+from sklearn.svm import LinearSVC
+
+svm_model = LinearSVC(class_weight="balanced")
+svm_model.fit(X_train, y_train)
+
+
+
+-------------------------------trials not tested-----------------
+
+from xgboost import XGBClassifier
+
+xgb_model = XGBClassifier(
+    n_estimators=300,
+    max_depth=6,
+    learning_rate=0.1,
+    objective="multi:softmax",
+    num_class=len(label_encoder.classes_),
+    eval_metric="mlogloss"
+)
+
+xgb_model.fit(X_train, y_train)
+
+
+from sklearn.metrics import classification_report, confusion_matrix
+
+y_pred = svm_model.predict(X_val)
+
+print("Classification Report:\n")
+print(classification_report(
+    y_val,
+    y_pred,
+    target_names=label_encoder.classes_
+))
+
+
+
+import joblib
+
+joblib.dump(svm_model, "log_classifier.pkl")
+joblib.dump(vectorizer, "tfidf_vectorizer.pkl")
+joblib.dump(label_encoder, "label_encoder.pkl")
+
+
+
+def predict_log_file(log_lines):
+    # Normalize
+    normalized = [
+        normalize_log(line)
+        for line in log_lines
+        if normalize_log(line) is not None
+    ]
+
+    # Extract templates
+    templates = extract_templates(normalized)
+
+    # Create document
+    doc = " ".join(templates)
+
+    # Vectorize
+    X_new = vectorizer.transform([doc])
+
+    # Predict
+    pred = svm_model.predict(X_new)
+
+    return label_encoder.inverse_transform(pred)[0]
+
+
+
+new_log_lines = read_log_file("logs/new_log.log")
+prediction = predict_log_file(new_log_lines)
+
+print("Predicted class:", prediction)
+
+
+
