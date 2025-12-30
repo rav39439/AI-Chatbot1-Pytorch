@@ -1,0 +1,621 @@
+# import pandas as pd
+# import torch
+# import numpy as np
+# from transformers import AutoTokenizer, AutoModel
+# from sklearn.linear_model import LogisticRegression
+# from sklearn.preprocessing import LabelEncoder
+# from sklearn.metrics import accuracy_score
+# from tqdm import tqdm
+# # -----------------------------
+# # Device & Performance Settings
+# # -----------------------------
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# torch.backends.cudnn.benchmark = True
+
+# USE_FP16 = device.type == "cuda"
+
+# # -----------------------------
+# # Load Dataset
+# # -----------------------------
+# train_df = pd.read_csv("/kaggle/input/ag-news-classification-dataset/train.csv")
+# test_df = pd.read_csv("/kaggle/input/ag-news-classification-dataset/test.csv")
+
+# X_train_text = train_df["Description"].tolist()
+# X_test_text = test_df["Description"].tolist()
+
+# y_train = train_df["Class Index"].tolist()
+# y_test = test_df["Class Index"].tolist()
+
+# # Encode labels
+# label_encoder = LabelEncoder()
+# y_train_enc = label_encoder.fit_transform(y_train)
+# y_test_enc = label_encoder.transform(y_test)
+
+# # -----------------------------
+# # Load BERT (FAST)
+# # -----------------------------
+# tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", use_fast=True)
+# bert_model = AutoModel.from_pretrained("bert-base-uncased")
+
+# bert_model.to(device)
+# bert_model.eval()
+# # -----------------------------
+# # Optimized BERT Embedding Function
+# # -----------------------------
+# def bert_embeddings(texts, batch_size=64):
+#     all_embeddings = []
+
+#     for i in tqdm(range(0, len(texts), batch_size), desc="Embedding"):
+#         batch_texts = texts[i:i + batch_size]
+
+#         encoded = tokenizer(
+#             batch_texts,
+#             padding=True,
+#             truncation=True,
+#             max_length=128,
+#             return_tensors="pt"
+#         )
+
+#         encoded = {k: v.to(device, non_blocking=True) for k, v in encoded.items()}
+
+#         with torch.inference_mode():
+#             if USE_FP16:
+#                 with torch.cuda.amp.autocast():
+#                     outputs = bert_model(**encoded)
+#             else:
+#                 outputs = bert_model(**encoded)
+
+#             # CLS token
+#             cls_embeddings = outputs.last_hidden_state[:, 0, :]
+
+#         all_embeddings.append(cls_embeddings.cpu())
+
+#     return torch.cat(all_embeddings, dim=0).numpy()
+
+# # -----------------------------
+# # Generate Embeddings (GPU)
+# # -----------------------------
+# X_train_emb = bert_embeddings(X_train_text)
+# X_test_emb = bert_embeddings(X_test_text)
+
+# print("Train embeddings:", X_train_emb.shape)
+# print("Test embeddings:", X_test_emb.shape)
+
+# # -----------------------------
+# # Train Logistic Regression (CPU – Correct)
+# # -----------------------------
+
+
+
+import pandas as pd
+import torch
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score
+from tqdm import tqdm
+# -----------------------------
+# Device
+# -----------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -----------------------------
+# Load Dataset
+# -----------------------------
+train_df = pd.read_csv("/kaggle/input/ag-news-classification-dataset/train.csv")
+test_df = pd.read_csv("/kaggle/input/ag-news-classification-dataset/test.csv")
+
+X_train_text = train_df["Description"].tolist()
+X_test_text = test_df["Description"].tolist()
+
+y_train = train_df["Class Index"].tolist()
+y_test = test_df["Class Index"].tolist()
+
+# Encode labels
+label_encoder = LabelEncoder()
+y_train_enc = label_encoder.fit_transform(y_train)
+y_test_enc = label_encoder.transform(y_test)
+
+# -----------------------------
+# Load SentenceTransformer
+# -----------------------------
+model_name = 'all-MiniLM-L6-v2'  # small & fast, good for classification
+sentence_model = SentenceTransformer(model_name, device=device)
+
+# -----------------------------
+# Generate Sentence Embeddings
+# -----------------------------
+def sentence_embeddings(texts, batch_size=64):
+    embeddings = []
+    for i in tqdm(range(0, len(texts), batch_size), desc="Embedding"):
+        batch_texts = texts[i:i + batch_size]
+        emb = sentence_model.encode(batch_texts, batch_size=len(batch_texts), convert_to_tensor=False, show_progress_bar=False)
+        embeddings.append(np.array(emb))
+    return np.vstack(embeddings)
+
+X_train_emb = sentence_embeddings(X_train_text)
+X_test_emb = sentence_embeddings(X_test_text)
+
+print("Train embeddings:", X_train_emb.shape)
+print("Test embeddings:", X_test_emb.shape)
+
+
+
+
+
+#----------lower dimensionality optional--------------
+
+# from sklearn.decomposition import PCA
+
+# pca = PCA(n_components=256)
+# X_train_emb = pca.fit_transform(X_train_emb)
+# X_test_emb = pca.transform(X_test_emb)
+
+#---------------------logistic regression saga optional speed up------------
+
+# clf = LogisticRegression(
+#     max_iter=500,
+#     solver="saga",
+#     n_jobs=-1,
+#     multi_class="auto"
+# )
+
+
+clf = LogisticRegression(
+    max_iter=1000,
+    n_jobs=-1,
+    multi_class="auto",
+    solver="lbfgs"
+)
+
+clf.fit(X_train_emb, y_train_enc)
+
+# -----------------------------
+# Evaluation
+# -----------------------------
+y_pred = clf.predict(X_test_emb)
+accuracy = accuracy_score(y_test_enc, y_pred)
+
+print(f"✅ Test Accuracy: {accuracy:.4f}")
+
+
+
+
+from sklearn.svm import LinearSVC
+from sklearn.metrics import accuracy_score
+
+clf = LinearSVC(C=1.0)
+clf.fit(X_train_emb, y_train_enc)
+
+y_pred = clf.predict(X_test_emb)
+print("Accuracy:", accuracy_score(y_test_enc, y_pred))
+
+
+
+
+
+from sklearn.preprocessing import StandardScaler
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_emb)
+X_test_scaled = scaler.transform(X_test_emb)
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score
+
+clf = MLPClassifier(
+    hidden_layer_sizes=(512, 128),
+    activation="relu",
+    solver="adam",
+    alpha=1e-4,                 # L2 regularization
+    batch_size=64,
+    learning_rate="adaptive",
+    learning_rate_init=1e-3,
+    max_iter=500,
+    early_stopping=True,
+    validation_fraction=0.1,
+    n_iter_no_change=10,
+    random_state=42
+)
+
+clf.fit(X_train_scaled, y_train_enc)
+
+y_pred = clf.predict(X_test_scaled)
+accuracy = accuracy_score(y_test_enc, y_pred)
+
+print(f"✅ Optimized MLP (BERT) Accuracy: {accuracy:.4f}")
+
+
+
+
+#-------------------for word embeddings--------------------
+
+# import torch
+# import torch.nn as nn
+# import torch.optim as optim
+# from sklearn.preprocessing import StandardScaler
+# from sklearn.metrics import accuracy_score
+# # -----------------------------
+# # Assume these exist
+# # -----------------------------
+# # X_train_emb, X_test_emb : numpy arrays of shape [num_samples, 768]
+# # y_train_enc, y_test_enc : numpy arrays of shape [num_samples] with class indices
+# # num_classes : number of target classes
+# num_classes=4
+# # -----------------------------
+# # 1. Normalize embeddings
+# # -----------------------------
+# scaler = StandardScaler()
+# X_train_scaled = scaler.fit_transform(X_train_emb)
+# X_test_scaled = scaler.transform(X_test_emb)
+
+# # Convert to torch tensors
+# X_train = torch.tensor(X_train_scaled, dtype=torch.float32).cuda()
+# X_test = torch.tensor(X_test_scaled, dtype=torch.float32).cuda()
+# y_train = torch.tensor(y_train_enc, dtype=torch.long).cuda()
+# y_test = torch.tensor(y_test_enc, dtype=torch.long).cuda()
+
+# # -----------------------------
+# # 2. Define the classifier
+# # -----------------------------
+# model = nn.Sequential(
+#     nn.Linear(768, 256),
+#     nn.ReLU(),
+#     nn.Linear(256, num_classes)
+# ).cuda()
+
+# # -----------------------------
+# # 3. Loss and optimizer
+# # -----------------------------
+# criterion = nn.CrossEntropyLoss()
+# optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+# # -----------------------------
+# # 4. Training loop
+# # -----------------------------
+# num_epochs = 180
+# batch_size = 64
+
+# for epoch in range(num_epochs):
+#     permutation = torch.randperm(X_train.size()[0])
+#     epoch_loss = 0.0
+
+#     for i in range(0, X_train.size()[0], batch_size):
+#         indices = permutation[i:i+batch_size]
+#         batch_X, batch_y = X_train[indices], y_train[indices]
+
+#         optimizer.zero_grad()
+#         outputs = model(batch_X)
+#         loss = criterion(outputs, batch_y)
+#         loss.backward()
+#         optimizer.step()
+
+#         epoch_loss += loss.item() * batch_X.size(0)
+
+#     epoch_loss /= X_train.size()[0]
+#     if (epoch+1) % 10 == 0:
+#         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}")
+
+# # -----------------------------
+# # 5. Predictions and scores
+# # -----------------------------
+# with torch.no_grad():
+#     logits = model(X_test)
+#     probs = torch.softmax(logits, dim=1)       # Probability scores per class
+#     preds = torch.argmax(probs, dim=1)         # Predicted class indices
+
+# # Accuracy
+# accuracy = (preds == y_test).float().mean().item()
+# print(f"✅ Test Accuracy: {accuracy:.4f}")
+
+# # Optional: Show predicted probabilities for first 5 samples
+# print("Predicted probabilities (first 5 samples):")
+# print(probs[:5])
+
+
+#=--------------------for sentence embeddings--------------
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+from sentence_transformers import SentenceTransformer
+
+# -----------------------------
+# Parameters
+# -----------------------------
+num_classes = 4
+num_epochs = 120
+batch_size = 64
+embedding_dim = 384  # for all-MiniLM-L6-v2 embeddings
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# -----------------------------
+# Load / Prepare Data
+# -----------------------------
+# X_train_text, X_test_text : lists of strings
+# y_train_enc, y_test_enc : numpy arrays of class indices
+# Example:
+# X_train_text = train_df["Description"].tolist()
+# y_train_enc = label_encoder.transform(train_df["Class Index"].tolist())
+
+# -----------------------------
+# Generate SentenceTransformer embeddings
+# -----------------------------
+sentence_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+
+def get_embeddings(texts):
+    return sentence_model.encode(
+        texts,
+        convert_to_tensor=False,
+        show_progress_bar=True
+    )
+
+
+
+# -----------------------------
+# 1. Normalize embeddings
+# -----------------------------
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_emb)
+X_test_scaled = scaler.transform(X_test_emb)
+
+# Convert to torch tensors
+X_train = torch.tensor(X_train_scaled, dtype=torch.float32).to(device)
+X_test = torch.tensor(X_test_scaled, dtype=torch.float32).to(device)
+y_train = torch.tensor(y_train_enc, dtype=torch.long).to(device)
+y_test = torch.tensor(y_test_enc, dtype=torch.long).to(device)
+
+# -----------------------------
+# 2. Define the classifier
+# -----------------------------
+model = nn.Sequential(
+    nn.Linear(embedding_dim, 256),
+    nn.ReLU(),
+    nn.Linear(256, num_classes)
+).to(device)
+
+# -----------------------------
+# 3. Loss and optimizer
+# -----------------------------
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+# -----------------------------
+# 4. Training loop
+# -----------------------------
+for epoch in range(num_epochs):
+    permutation = torch.randperm(X_train.size(0))
+    epoch_loss = 0.0
+
+    for i in range(0, X_train.size(0), batch_size):
+        indices = permutation[i:i+batch_size]
+        batch_X, batch_y = X_train[indices], y_train[indices]
+
+        optimizer.zero_grad()
+        outputs = model(batch_X)
+        loss = criterion(outputs, batch_y)
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item() * batch_X.size(0)
+
+    epoch_loss /= X_train.size(0)
+    if (epoch + 1) % 10 == 0:
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}")
+
+# -----------------------------
+# 5. Predictions and scores
+# -----------------------------
+with torch.no_grad():
+    logits = model(X_test)
+    probs = torch.softmax(logits, dim=1)       # Probability scores per class
+    preds = torch.argmax(probs, dim=1)         # Predicted class indices
+
+# Accuracy
+accuracy = (preds == y_test).float().mean().item()
+print(f"✅ Test Accuracy: {accuracy:.4f}")
+
+# Optional: Show predicted probabilities for first 5 samples
+print("Predicted probabilities (first 5 samples):")
+print(probs[:5])
+
+
+
+
+import torch
+import numpy as np
+# -----------------------------
+# Device
+# -----------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -----------------------------
+# Convert custom embeddings to torch tensor
+# -----------------------------
+X_custom = torch.tensor(custom_embeddings, dtype=torch.float32).to(device)
+
+# -----------------------------
+# Make predictions with PyTorch model
+# -----------------------------
+with torch.no_grad():
+    logits = model(X_custom)                  # model is your nn.Sequential MLP
+    probs = torch.softmax(logits, dim=1)     # class probabilities
+    pred_ids = torch.argmax(probs, dim=1).cpu().numpy()  # predicted class indices
+
+# -----------------------------
+# Display Results
+# -----------------------------
+print("📌 Custom Sample Predictions (Manual Evaluation)\n")
+
+for i, (text, actual_label) in enumerate(custom_samples):
+    pred_id = pred_ids[i]
+    pred_label = id_to_label[pred_id]
+
+    print(f"Example {i+1}")
+    print("📝 Input Text:")
+    print(text)
+    print("🔮 Predicted:", pred_label)
+    print("✅ Actual   :", actual_label)
+    print("-" * 70)
+
+
+
+#-------------------word embeddings-------------------------------
+y_pred = clf.predict(X_test_emb)
+accuracy = accuracy_score(y_test_enc, y_pred)
+
+print(f"✅ Test Accuracy: {accuracy:.4f}")
+
+
+# import torch
+# import numpy as np
+
+# # -----------------------------
+# # Class ID → Label Mapping
+# # -----------------------------
+# id_to_label = {
+#     1: "World",
+#     2: "Sports",
+#     3: "Business",
+#     4: "Sci/Tech"
+# }
+
+# label_to_id = {v: k for k, v in id_to_label.items()}
+
+# # -----------------------------
+# # Custom Input Samples (Manually Written)
+# # -----------------------------
+# custom_samples = [
+#     ("Global leaders meet to discuss climate change agreements", "World"),
+#     ("The stock market surged after the company reported strong profits", "Business"),
+#     ("The football team secured a last-minute victory in the final match", "Sports"),
+#     ("Scientists developed a new AI chip for faster computation", "Sci/Tech"),
+#     ("Oil prices fall as international tensions ease", "World"),
+#     ("The startup raised millions in venture capital funding", "Business"),
+#     ("The tennis champion won her 25th Grand Slam title", "Sports"),
+#     ("Researchers announce a breakthrough in quantum computing", "Sci/Tech"),
+#     ("Trade negotiations between countries continue amid economic concerns", "World"),
+#     ("Tech giants face antitrust scrutiny from regulators", "Business")
+# ]
+
+# texts = [x[0] for x in custom_samples]
+# actual_labels = [x[1] for x in custom_samples]
+
+# # -----------------------------
+# # Generate BERT Embeddings
+# # -----------------------------
+# def embed_text(texts):
+#     encoded = tokenizer(
+#         texts,
+#         padding=True,
+#         truncation=True,
+#         max_length=128,
+#         return_tensors="pt"
+#     )
+
+#     encoded = {k: v.to(device) for k, v in encoded.items()}
+
+#     with torch.inference_mode():
+#         outputs = bert_model(**encoded)
+#         cls_embeddings = outputs.last_hidden_state[:, 0, :]
+
+#     return cls_embeddings.cpu().numpy()
+
+# custom_embeddings = embed_text(texts)
+
+# # -----------------------------
+# # Predictions
+# # -----------------------------
+# pred_ids = clf.predict(custom_embeddings)
+
+# # -----------------------------
+# # Display Results
+# # -----------------------------
+# print("📌 Custom Sample Predictions (Manual Evaluation)\n")
+
+# for i, (text, actual_label) in enumerate(custom_samples):
+#     pred_id = pred_ids[i]
+#     pred_label = id_to_label[pred_id]
+
+#     print(f"Example {i+1}")
+#     print("📝 Input Text:")
+#     print(text)
+#     print("🔮 Predicted:", pred_label)
+#     print("✅ Actual   :", actual_label)
+#     print("-" * 70)
+
+#-------------------sentence embeddings--------------------
+
+import torch
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+id_to_label = {
+    1: "World",
+    2: "Sports",
+    3: "Business",
+    4: "Sci/Tech"
+}
+# -----------------------------
+# Custom Input Samples (Manually Written)
+# -----------------------------
+custom_samples = [
+    ("Global leaders meet to discuss climate change agreements", "World"),
+    ("The stock market surged after the company reported strong profits", "Business"),
+    ("The football team secured a last-minute victory in the final match", "Sports"),
+    ("Scientists developed a new AI chip for faster computation", "Sci/Tech"),
+    ("Oil prices fall as international tensions ease", "World"),
+    ("The startup raised millions in venture capital funding", "Business"),
+    ("The tennis champion won her 25th Grand Slam title", "Sports"),
+    ("Researchers announce a breakthrough in quantum computing", "Sci/Tech"),
+    ("Trade negotiations between countries continue amid economic concerns", "World"),
+    ("Tech giants face antitrust scrutiny from regulators", "Business")
+]
+
+texts = [x[0] for x in custom_samples]
+actual_labels = [x[1] for x in custom_samples]
+
+# -----------------------------
+# Load SentenceTransformer
+# -----------------------------
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+sentence_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+
+# -----------------------------
+# Generate Sentence Embeddings
+# -----------------------------
+custom_embeddings = sentence_model.encode(
+    texts,
+    convert_to_tensor=False,
+    show_progress_bar=False
+)
+
+# -----------------------------
+# Predict using trained classifier
+# -----------------------------
+pred_ids = clf.predict(custom_embeddings)
+
+# Map back to original labels using LabelEncoder
+pred_labels = label_encoder.inverse_transform(pred_ids)
+# -----------------------------
+# Display Results
+# -----------------------------
+print("📌 Custom Sample Predictions (SentenceTransformer + LR)\n")
+
+for i, (text, actual_label) in enumerate(custom_samples):
+    pred_label = pred_labels[i]
+    print(f"Example {i+1}")
+    print("📝 Input Text:")
+    print(text)
+    print("🔮 Predicted:", id_to_label[pred_label])
+    print("✅ Actual   :", actual_label)
+    print("-" * 70)
+
+
+
+
+
